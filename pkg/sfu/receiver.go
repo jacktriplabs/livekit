@@ -2,7 +2,6 @@ package sfu
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -30,6 +29,7 @@ var (
 )
 
 type AudioLevelHandle func(level uint8, duration uint32)
+
 type Bitrates [DefaultMaxLayerSpatial + 1][DefaultMaxLayerTemporal + 1]int64
 
 // TrackReceiver defines an interface receive media from remote peer
@@ -38,9 +38,10 @@ type TrackReceiver interface {
 	StreamID() string
 	Codec() webrtc.RTPCodecParameters
 	HeaderExtensions() []webrtc.RTPHeaderExtensionParameter
+	IsClosed() bool
 
 	ReadRTP(buf []byte, layer uint8, sn uint16) (int, error)
-	GetLayeredBitrate() Bitrates
+	GetLayeredBitrate() ([]int32, Bitrates)
 
 	GetAudioLevel() (float64, bool)
 
@@ -65,7 +66,7 @@ type TrackReceiver interface {
 
 	GetTemporalLayerFpsForSpatial(layer int32) []float32
 
-	GetRTCPSenderReportData(layer int32) *buffer.RTCPSenderReportData
+	GetRTCPSenderReportDataExt(layer int32) *buffer.RTCPSenderReportDataExt
 	GetReferenceLayerRTPTimestamp(ts uint32, layer int32, referenceLayer int32) (uint32, error)
 }
 
@@ -197,6 +198,7 @@ func NewWebRTCReceiver(
 	w.streamTrackerManager = NewStreamTrackerManager(logger, trackInfo, w.isSVC, w.codec.ClockRate, trackersConfig)
 	w.streamTrackerManager.OnAvailableLayersChanged(w.downTrackLayerChange)
 	w.streamTrackerManager.OnBitrateAvailabilityChanged(w.downTrackBitrateAvailabilityChange)
+	w.streamTrackerManager.OnMaxPublishedLayerChanged(w.downTrackMaxPublishedLayerChange)
 
 	for _, opt := range opts {
 		w = opt(w)
@@ -245,6 +247,10 @@ func (w *WebRTCReceiver) OnMaxLayerChange(fn func(maxLayer int32)) {
 
 func (w *WebRTCReceiver) GetConnectionScore() float32 {
 	return w.connectionStats.GetScore()
+}
+
+func (w *WebRTCReceiver) IsClosed() bool {
+	return w.closed.Load()
 }
 
 func (w *WebRTCReceiver) SetRTT(rtt uint32) {
@@ -316,6 +322,8 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 	})
 	buff.OnRtcpFeedback(w.sendRTCP)
 	buff.OnRtcpSenderReport(func(srData *buffer.RTCPSenderReportData) {
+		w.streamTrackerManager.SetRTCPSenderReportDataExt(layer, buff.GetSenderReportDataExt())
+
 		w.downTrackSpreader.Broadcast(func(dt TrackSender) {
 			_ = dt.HandleRTCPSenderReportData(w.codec.PayloadType, layer, srData)
 		})
@@ -380,12 +388,8 @@ func (w *WebRTCReceiver) AddDownTrack(track TrackSender) error {
 		w.logger.Infow("subscriberID already exists, replacing downtrack", "subscriberID", track.SubscriberID())
 	}
 
-	if w.Kind() == webrtc.RTPCodecTypeVideo {
-		// notify added down track of available layers
-		availableLayers, exemptedLayers := w.streamTrackerManager.GetAvailableLayers()
-		track.UpTrackLayersChange(availableLayers, exemptedLayers)
-	}
 	track.TrackInfoAvailable()
+	track.UpTrackMaxPublishedLayerChange(w.streamTrackerManager.GetMaxPublishedLayer())
 
 	w.downTrackSpreader.Store(track)
 	return nil
@@ -395,9 +399,9 @@ func (w *WebRTCReceiver) SetMaxExpectedSpatialLayer(layer int32) {
 	w.streamTrackerManager.SetMaxExpectedSpatialLayer(layer)
 }
 
-func (w *WebRTCReceiver) downTrackLayerChange(availableLayers []int32, exemptedLayers []int32) {
+func (w *WebRTCReceiver) downTrackLayerChange() {
 	for _, dt := range w.downTrackSpreader.GetDownTracks() {
-		dt.UpTrackLayersChange(availableLayers, exemptedLayers)
+		dt.UpTrackLayersChange()
 	}
 }
 
@@ -407,7 +411,13 @@ func (w *WebRTCReceiver) downTrackBitrateAvailabilityChange() {
 	}
 }
 
-func (w *WebRTCReceiver) GetLayeredBitrate() Bitrates {
+func (w *WebRTCReceiver) downTrackMaxPublishedLayerChange(maxPublishedLayer int32) {
+	for _, dt := range w.downTrackSpreader.GetDownTracks() {
+		dt.UpTrackMaxPublishedLayerChange(maxPublishedLayer)
+	}
+}
+
+func (w *WebRTCReceiver) GetLayeredBitrate() ([]int32, Bitrates) {
 	return w.streamTrackerManager.GetLayeredBitrate()
 }
 
@@ -698,53 +708,10 @@ func (w *WebRTCReceiver) GetTemporalLayerFpsForSpatial(layer int32) []float32 {
 	return b.GetTemporalLayerFpsForSpatial(layer)
 }
 
-func (w *WebRTCReceiver) GetRTCPSenderReportData(layer int32) *buffer.RTCPSenderReportData {
-	w.bufferMu.RLock()
-	defer w.bufferMu.RUnlock()
-
-	if layer == InvalidLayerSpatial || int(layer) >= len(w.buffers) {
-		return nil
-	}
-
-	return w.buffers[layer].GetSenderReportData()
+func (w *WebRTCReceiver) GetRTCPSenderReportDataExt(layer int32) *buffer.RTCPSenderReportDataExt {
+	return w.streamTrackerManager.GetRTCPSenderReportDataExt(layer)
 }
 
 func (w *WebRTCReceiver) GetReferenceLayerRTPTimestamp(ts uint32, layer int32, referenceLayer int32) (uint32, error) {
-	w.bufferMu.RLock()
-	defer w.bufferMu.RUnlock()
-
-	if layer == referenceLayer {
-		return ts, nil
-	}
-
-	bLayer := w.getBufferLocked(layer)
-	if bLayer == nil {
-		return 0, fmt.Errorf("invalid layer: %d", layer)
-	}
-	srLayer := bLayer.GetSenderReportData()
-	if srLayer == nil || srLayer.NTPTimestamp == 0 {
-		return 0, fmt.Errorf("layer rtcp sender report not available: %d", layer)
-	}
-
-	bReferenceLayer := w.getBufferLocked(referenceLayer)
-	if bReferenceLayer == nil {
-		return 0, fmt.Errorf("invalid reference layer: %d", referenceLayer)
-	}
-	srRef := bReferenceLayer.GetSenderReportData()
-	if srRef == nil || srRef.NTPTimestamp == 0 {
-		return 0, fmt.Errorf("reference layer rtcp sender report not available: %d", referenceLayer)
-	}
-
-	// line up the RTP time stamps using NTP time of most recent sender report of layer and referenceLayer
-	// NOTE: It is possible that reference layer has stopped (due to dynacast/adaptive streaming OR publisher
-	// constraints). It should be okay even if the layer has stopped for a long time when using modulo arithmetic for
-	// RTP time stamp (uint32 arithmetic).
-	ntpDiff := float64(int64(srRef.NTPTimestamp-srLayer.NTPTimestamp)) / float64(1<<32)
-	normalizedTS := srLayer.RTPTimestamp + uint32(ntpDiff*float64(w.codec.ClockRate))
-
-	// now that both RTP timestamps correspond to roughly the same NTP time,
-	// the diff between them is the offset in RTP timestamp units between layer and referenceLayer.
-	// Add the offset to layer's ts to map it to corresponding RTP timestamp in
-	// the reference layer.
-	return ts + (srRef.RTPTimestamp - normalizedTS), nil
+	return w.streamTrackerManager.GetReferenceLayerRTPTimestamp(ts, layer, referenceLayer)
 }

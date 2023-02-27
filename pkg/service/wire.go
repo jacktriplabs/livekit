@@ -7,26 +7,24 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/google/wire"
 	"github.com/pion/turn/v2"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
-
-	"github.com/livekit/livekit-server/pkg/service/rpc"
-	"github.com/livekit/livekit-server/pkg/utils"
-	"github.com/livekit/protocol/auth"
-	"github.com/livekit/protocol/egress"
-	"github.com/livekit/protocol/ingress"
-	"github.com/livekit/protocol/livekit"
-	redisLiveKit "github.com/livekit/protocol/redis"
-	"github.com/livekit/protocol/webhook"
-	"github.com/livekit/psrpc"
 
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/egress"
+	"github.com/livekit/protocol/livekit"
+	redisLiveKit "github.com/livekit/protocol/redis"
+	"github.com/livekit/protocol/rpc"
+	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/webhook"
+	"github.com/livekit/psrpc"
 )
 
 func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*LivekitServer, error) {
@@ -46,16 +44,15 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		telemetry.NewAnalyticsService,
 		telemetry.NewTelemetryService,
 		getMessageBus,
+		NewIOInfoService,
 		getEgressClient,
 		egress.NewRedisRPCClient,
 		getEgressStore,
 		NewEgressLauncher,
 		NewEgressService,
-		ingress.NewRedisRPC,
-		getIngressClient,
+		rpc.NewIngressClient,
 		getIngressStore,
 		getIngressConfig,
-		getIngressRPCClient,
 		NewIngressService,
 		NewRoomAllocator,
 		NewRoomService,
@@ -161,14 +158,6 @@ func getEgressStore(s ObjectStore) EgressStore {
 	}
 }
 
-func getIngressClient(conf *config.Config, nodeID livekit.NodeID, bus psrpc.MessageBus) (rpc.IngressClient, error) {
-	if conf.Ingress.UsePsRPC {
-		return rpc.NewIngressClient(nodeID, bus)
-	}
-
-	return nil, nil
-}
-
 func getIngressStore(s ObjectStore) IngressStore {
 	switch store := s.(type) {
 	case *RedisStore:
@@ -180,10 +169,6 @@ func getIngressStore(s ObjectStore) IngressStore {
 
 func getIngressConfig(conf *config.Config) *config.IngressConfig {
 	return &conf.Ingress
-}
-
-func getIngressRPCClient(rpc ingress.RPC) ingress.RPCClient {
-	return rpc
 }
 
 func createClientConfiguration() clientconfiguration.ClientConfigurationManager {
