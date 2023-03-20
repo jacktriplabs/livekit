@@ -43,6 +43,11 @@ const (
 	iceFailedTimeout       = 25 * time.Second // pion's default
 	iceKeepaliveInterval   = 2 * time.Second  // pion's default
 
+	minTcpICEConnectTimeout = 5 * time.Second
+	maxTcpICEConnectTimeout = 12 * time.Second // js-sdk has a default 15s timeout for first connection, let server detect failure earlier before that
+
+	maxConnectTimeoutAfterICE = 20 * time.Second // max duration for waiting pc to connect after ICE is connected
+
 	shortConnectionThreshold = 90 * time.Second
 )
 
@@ -153,8 +158,14 @@ type PCTransport struct {
 	lossyDCOpened    bool
 	onDataPacket     func(kind livekit.DataPacket_Kind, data []byte)
 
-	iceConnectedAt time.Time
-	connectedAt    time.Time
+	iceStartedAt               time.Time
+	iceConnectedAt             time.Time
+	firstConnectedAt           time.Time
+	connectedAt                time.Time
+	tcpICETimer                *time.Timer
+	connectAfterICETimer       *time.Timer // timer to wait for pc to connect after ice connected
+	resetShortConnOnICERestart atomic.Bool
+	signalingRTT               atomic.Uint32 // milliseconds
 
 	onFullyEstablished func()
 
@@ -397,6 +408,38 @@ func (t *PCTransport) createPeerConnection() error {
 	return nil
 }
 
+func (t *PCTransport) SetSignalingRTT(rtt uint32) {
+	t.signalingRTT.Store(rtt)
+}
+
+func (t *PCTransport) setICEStartedAt(at time.Time) {
+	t.lock.Lock()
+	if t.iceStartedAt.IsZero() {
+		t.iceStartedAt = at
+
+		// set failure timer for tcp ice connection based on signaling RTT
+		if t.preferTCP.Load() {
+			signalingRTT := t.signalingRTT.Load()
+			if signalingRTT < 1000 {
+				tcpICETimeout := time.Duration(signalingRTT*8) * time.Millisecond
+				if tcpICETimeout < minTcpICEConnectTimeout {
+					tcpICETimeout = minTcpICEConnectTimeout
+				} else if tcpICETimeout > maxTcpICEConnectTimeout {
+					tcpICETimeout = maxTcpICEConnectTimeout
+				}
+				t.params.Logger.Debugw("set tcp ice connect timer", "timeout", tcpICETimeout, "signalRTT", signalingRTT)
+				t.tcpICETimer = time.AfterFunc(tcpICETimeout, func() {
+					if t.pc.ICEConnectionState() == webrtc.ICEConnectionStateChecking {
+						t.params.Logger.Infow("tcp ice connect timeout", "timeout", tcpICETimeout, "signalRTT", signalingRTT)
+						t.handleConnectionFailed(true)
+					}
+				})
+			}
+		}
+	}
+	t.lock.Unlock()
+}
+
 func (t *PCTransport) setICEConnectedAt(at time.Time) {
 	t.lock.Lock()
 	if t.iceConnectedAt.IsZero() {
@@ -405,6 +448,51 @@ func (t *PCTransport) setICEConnectedAt(at time.Time) {
 		// This prevents reset of connected at time if ICE goes `Connected` -> `Disconnected` -> `Connected`.
 		//
 		t.iceConnectedAt = at
+
+		// set failure timer for dtls handshake
+		iceDuration := at.Sub(t.iceStartedAt)
+		// let ice has chance to become disconnected if user close/refresh client app before transport full connected.
+		connTimeoutAfterICE := iceDisconnectedTimeout + time.Second + iceDuration
+		if connTimeoutAfterICE < 3*iceDuration {
+			connTimeoutAfterICE = 3 * iceDuration
+		}
+		if connTimeoutAfterICE > maxConnectTimeoutAfterICE {
+			connTimeoutAfterICE = maxConnectTimeoutAfterICE
+		}
+		t.params.Logger.Debugw("setting connection timer after ice connected", "timeout", connTimeoutAfterICE, "iceDuration", iceDuration)
+		t.connectAfterICETimer = time.AfterFunc(connTimeoutAfterICE, func() {
+			state := t.pc.ConnectionState()
+			iceState := t.pc.ICEConnectionState()
+			// if ice connected, pc is still checking or connected but not fully established after timeout, then fire connection fail
+			if iceState == webrtc.ICEConnectionStateConnected && state != webrtc.PeerConnectionStateClosed &&
+				state != webrtc.PeerConnectionStateFailed && !t.isFullyEstablished() {
+				t.params.Logger.Infow("connect timeout after ICE connected", "timeout", connTimeoutAfterICE, "iceDuration", iceDuration)
+				t.handleConnectionFailed(false)
+			}
+		})
+
+		// clear tcp ice connect timer
+		if t.tcpICETimer != nil {
+			t.tcpICETimer.Stop()
+			t.tcpICETimer = nil
+		}
+	}
+	t.lock.Unlock()
+}
+
+func (t *PCTransport) resetShortConn() {
+	t.params.Logger.Infow("resetting short connection on ICE restart")
+	t.lock.Lock()
+	t.iceStartedAt = time.Time{}
+	t.iceConnectedAt = time.Time{}
+	t.connectedAt = time.Time{}
+	if t.connectAfterICETimer != nil {
+		t.connectAfterICETimer.Stop()
+		t.connectAfterICETimer = nil
+	}
+	if t.tcpICETimer != nil {
+		t.tcpICETimer.Stop()
+		t.tcpICETimer = nil
 	}
 	t.lock.Unlock()
 }
@@ -448,12 +536,13 @@ func (t *PCTransport) logICECandidates() {
 
 func (t *PCTransport) setConnectedAt(at time.Time) bool {
 	t.lock.Lock()
-	if !t.connectedAt.IsZero() {
+	t.connectedAt = at
+	if !t.firstConnectedAt.IsZero() {
 		t.lock.Unlock()
 		return false
 	}
 
-	t.connectedAt = at
+	t.firstConnectedAt = at
 	prometheus.ServiceOperationCounter.WithLabelValues("peer_connection", "success", "").Add(1)
 	t.lock.Unlock()
 	return true
@@ -477,15 +566,21 @@ func (t *PCTransport) onICECandidateTrickle(c *webrtc.ICECandidate) {
 	})
 }
 
-func (t *PCTransport) handleConnectionFailed() {
-	isShort, duration := t.isShortConnection(time.Now())
-	if isShort {
-		pair, err := t.getSelectedPair()
-		if err != nil {
-			t.params.Logger.Errorw("short ICE connection", err, "duration", duration)
-		} else {
-			t.params.Logger.Infow("short ICE connection", "pair", pair, "duration", duration)
+func (t *PCTransport) handleConnectionFailed(forceShortConn bool) {
+	isShort := forceShortConn
+	if !isShort {
+		var duration time.Duration
+		isShort, duration = t.isShortConnection(time.Now())
+		if isShort {
+			pair, err := t.getSelectedPair()
+			if err != nil {
+				t.params.Logger.Errorw("short ICE connection", err, "duration", duration)
+			} else {
+				t.params.Logger.Infow("short ICE connection", "pair", pair, "duration", duration)
+			}
 		}
+	} else {
+		t.params.Logger.Infow("force short ICE connection")
 	}
 
 	if onFailed := t.getOnFailed(); onFailed != nil {
@@ -503,6 +598,9 @@ func (t *PCTransport) onICEConnectionStateChange(state webrtc.ICEConnectionState
 		} else {
 			t.params.Logger.Infow("selected ICE candidate pair", "pair", pair)
 		}
+
+	case webrtc.ICEConnectionStateChecking:
+		t.setICEStartedAt(time.Now())
 	}
 }
 
@@ -510,7 +608,7 @@ func (t *PCTransport) onPeerConnectionStateChange(state webrtc.PeerConnectionSta
 	t.params.Logger.Debugw("peer connection state change", "state", state.String())
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
-		t.logICECandidates()
+		t.clearConnTimer()
 		isInitialConnection := t.setConnectedAt(time.Now())
 		if isInitialConnection {
 			if onInitialConnected := t.getOnInitialConnected(); onInitialConnected != nil {
@@ -521,8 +619,9 @@ func (t *PCTransport) onPeerConnectionStateChange(state webrtc.PeerConnectionSta
 		}
 	case webrtc.PeerConnectionStateFailed:
 		t.params.Logger.Infow("peer connection failed")
+		t.clearConnTimer()
 		t.logICECandidates()
-		t.handleConnectionFailed()
+		t.handleConnectionFailed(false)
 	}
 }
 
@@ -560,15 +659,18 @@ func (t *PCTransport) onDataChannel(dc *webrtc.DataChannel) {
 }
 
 func (t *PCTransport) maybeNotifyFullyEstablished() {
-	t.lock.RLock()
-	fullyEstablished := t.reliableDCOpened && t.lossyDCOpened && !t.connectedAt.IsZero()
-	t.lock.RUnlock()
-
-	if fullyEstablished {
+	if t.isFullyEstablished() {
 		if onFullyEstablished := t.getOnFullyEstablished(); onFullyEstablished != nil {
 			onFullyEstablished()
 		}
 	}
+}
+
+func (t *PCTransport) isFullyEstablished() bool {
+	t.lock.RLock()
+	fullyEstablished := t.reliableDCOpened && t.lossyDCOpened && !t.connectedAt.IsZero()
+	t.lock.RUnlock()
+	return fullyEstablished
 }
 
 func (t *PCTransport) SetPreferTCP(preferTCP bool) {
@@ -600,7 +702,7 @@ func (t *PCTransport) AddTrack(trackLocal webrtc.TrackLocal, params types.AddTra
 		}
 	}
 
-	// if never negotiated with client, can't reuse transeiver for track not subscribed before migration
+	// if never negotiated with client, can't reuse transceiver for track not subscribed before migration
 	if !canReuse {
 		return t.AddTransceiverFromTrack(trackLocal, params)
 	}
@@ -675,28 +777,40 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 		return err
 	}
 
+	reliableDCReadyHandler := func() {
+		t.params.Logger.Debugw("reliable data channel open")
+		t.lock.Lock()
+		t.reliableDCOpened = true
+		t.lock.Unlock()
+
+		t.maybeNotifyFullyEstablished()
+	}
+
+	lossyDCReadyHanlder := func() {
+		t.params.Logger.Debugw("lossy data channel open")
+		t.lock.Lock()
+		t.lossyDCOpened = true
+		t.lock.Unlock()
+
+		t.maybeNotifyFullyEstablished()
+	}
+
 	t.lock.Lock()
 	switch dc.Label() {
 	case ReliableDataChannel:
 		t.reliableDC = dc
-		t.reliableDC.OnOpen(func() {
-			t.params.Logger.Debugw("reliable data channel open")
-			t.lock.Lock()
-			t.reliableDCOpened = true
-			t.lock.Unlock()
-
-			t.maybeNotifyFullyEstablished()
-		})
+		if t.params.DirectionConfig.StrictACKs {
+			t.reliableDC.OnOpen(reliableDCReadyHandler)
+		} else {
+			t.reliableDC.OnDial(reliableDCReadyHandler)
+		}
 	case LossyDataChannel:
 		t.lossyDC = dc
-		t.lossyDC.OnOpen(func() {
-			t.params.Logger.Debugw("lossy data channel open")
-			t.lock.Lock()
-			t.lossyDCOpened = true
-			t.lock.Unlock()
-
-			t.maybeNotifyFullyEstablished()
-		})
+		if t.params.DirectionConfig.StrictACKs {
+			t.lossyDC.OnOpen(lossyDCReadyHanlder)
+		} else {
+			t.lossyDC.OnDial(lossyDCReadyHanlder)
+		}
 	default:
 		t.params.Logger.Errorw("unknown data channel label", nil, "label", dc.Label())
 	}
@@ -744,7 +858,7 @@ func (t *PCTransport) HasEverConnected() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 
-	return !t.connectedAt.IsZero()
+	return !t.firstConnectedAt.IsZero()
 }
 
 func (t *PCTransport) WriteRTCP(pkts []rtcp.Packet) error {
@@ -783,6 +897,21 @@ func (t *PCTransport) Close() {
 	}
 
 	_ = t.pc.Close()
+
+	t.clearConnTimer()
+}
+
+func (t *PCTransport) clearConnTimer() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.connectAfterICETimer != nil {
+		t.connectAfterICETimer.Stop()
+		t.connectAfterICETimer = nil
+	}
+	if t.tcpICETimer != nil {
+		t.tcpICETimer.Stop()
+		t.tcpICETimer = nil
+	}
 }
 
 func (t *PCTransport) HandleRemoteDescription(sd webrtc.SessionDescription) {
@@ -954,6 +1083,10 @@ func (t *PCTransport) ICERestart() {
 	})
 }
 
+func (t *PCTransport) ResetShortConnOnICERestart() {
+	t.resetShortConnOnICERestart.Store(true)
+}
+
 func (t *PCTransport) OnStreamStateChange(f func(update *sfu.StreamStateUpdate) error) {
 	if t.streamAllocator == nil {
 		return
@@ -1069,7 +1202,7 @@ func (t *PCTransport) preparePC(previousAnswer webrtc.SessionDescription) error 
 	}
 
 	// replace client's fingerprint into dump pc's answer, for pion's dtls process, it will
-	// keep the fingerprint at first call of SetRemoteDescription, if dumb pc and client pc use
+	// keep the fingerprint at first call of SetRemoteDescription, if dummy pc and client pc use
 	// different fingerprint, that will cause pion denied dtls data after handshake with client
 	// complete (can't pass fingerprint change).
 	// in this step, we don't established connection with dump pc(no candidate swap), just use
@@ -1113,7 +1246,7 @@ func (t *PCTransport) initPCWithPreviousAnswer(previousAnswer webrtc.SessionDesc
 			// for pion generate unmatched sdp, it always appends data channel to last m-lines,
 			// that not consistent with our previous answer that data channel might at middle-line
 			// because sdp can negotiate multi times before migration.(it will sticky to the last m-line atfirst negotiate)
-			// so use a dumb pc to negotiate sdp to fixed the datachannel's mid at same position with previous answer
+			// so use a dummy pc to negotiate sdp to fixed the datachannel's mid at same position with previous answer
 			if err := t.preparePC(previousAnswer); err != nil {
 				t.params.Logger.Errorw("prepare pc for migration failed", err)
 				return senders, err
@@ -1383,7 +1516,7 @@ func (t *PCTransport) handleRemoteICECandidate(e *event) error {
 }
 
 func (t *PCTransport) handleLogICECandidates(e *event) error {
-	t.params.Logger.Debugw(
+	t.params.Logger.Infow(
 		"ice candidates",
 		"lc", t.allowedLocalCandidates,
 		"rc", t.allowedRemoteCandidates,
@@ -1509,6 +1642,11 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 
 	offer, err := t.pc.CreateOffer(options)
 	if err != nil {
+		if errors.Is(err, webrtc.ErrConnectionClosed) {
+			t.params.Logger.Warnw("trying to create offer on closed peer connection", nil)
+			return nil
+		}
+
 		prometheus.ServiceOperationCounter.WithLabelValues("offer", "error", "create").Add(1)
 		return errors.Wrap(err, "create offer failed")
 	}
@@ -1520,6 +1658,11 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 
 	err = t.pc.SetLocalDescription(offer)
 	if err != nil {
+		if errors.Is(err, webrtc.ErrConnectionClosed) {
+			t.params.Logger.Warnw("trying to set local description on closed peer connection", nil)
+			return nil
+		}
+
 		prometheus.ServiceOperationCounter.WithLabelValues("offer", "error", "local_description").Add(1)
 		return errors.Wrap(err, "setting local description failed")
 	}
@@ -1594,6 +1737,11 @@ func (t *PCTransport) setRemoteDescription(sd webrtc.SessionDescription) error {
 	}
 
 	if err := t.pc.SetRemoteDescription(sd); err != nil {
+		if errors.Is(err, webrtc.ErrConnectionClosed) {
+			t.params.Logger.Warnw("trying to set remote description on closed peer connection", nil)
+			return nil
+		}
+
 		sdpType := "offer"
 		if sd.Type == webrtc.SDPTypeAnswer {
 			sdpType = "answer"
@@ -1622,6 +1770,11 @@ func (t *PCTransport) setRemoteDescription(sd webrtc.SessionDescription) error {
 func (t *PCTransport) createAndSendAnswer() error {
 	answer, err := t.pc.CreateAnswer(nil)
 	if err != nil {
+		if errors.Is(err, webrtc.ErrConnectionClosed) {
+			t.params.Logger.Warnw("trying to create answer on closed peer connection", nil)
+			return nil
+		}
+
 		prometheus.ServiceOperationCounter.WithLabelValues("answer", "error", "create").Add(1)
 		return errors.Wrap(err, "create answer failed")
 	}
@@ -1676,6 +1829,10 @@ func (t *PCTransport) handleRemoteOfferReceived(sd *webrtc.SessionDescription) e
 		return nil
 	}
 
+	if offerRestartICE && t.resetShortConnOnICERestart.CompareAndSwap(true, false) {
+		t.resetShortConn()
+	}
+
 	if err := t.setRemoteDescription(*sd); err != nil {
 		return err
 	}
@@ -1716,6 +1873,10 @@ func (t *PCTransport) doICERestart() error {
 		t.params.Logger.Debugw("deferring ICE restart to after gathering")
 		t.restartAfterGathering = true
 		return nil
+	}
+
+	if t.resetShortConnOnICERestart.CompareAndSwap(true, false) {
+		t.resetShortConn()
 	}
 
 	if t.negotiationState == NegotiationStateNone {
@@ -1762,7 +1923,7 @@ func (t *PCTransport) handleICERestart(e *event) error {
 	return t.doICERestart()
 }
 
-// configure subscriber tranceiver for audio stereo and nack
+// configure subscriber transceiver for audio stereo and nack
 func configureAudioTransceiver(tr *webrtc.RTPTransceiver, stereo bool, nack bool) {
 	sender := tr.Sender()
 	if sender == nil {

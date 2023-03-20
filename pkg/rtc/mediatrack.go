@@ -242,23 +242,18 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 		)
 		newWR.SetRTCPCh(t.params.RTCPChan)
 		newWR.OnCloseHandler(func() {
+			t.MediaTrackReceiver.SetClosing()
 			t.MediaTrackReceiver.ClearReceiver(mime, false)
 			if t.MediaTrackReceiver.TryClose() {
 				if t.dynacastManager != nil {
 					t.dynacastManager.Close()
 				}
-				t.params.Telemetry.TrackUnpublished(
-					context.Background(),
-					t.PublisherID(),
-					t.PublisherIdentity(),
-					t.ToProto(),
-					uint32(track.SSRC()),
-				)
 			}
 		})
 		newWR.OnStatsUpdate(func(_ *sfu.WebRTCReceiver, stat *livekit.AnalyticsStat) {
 			// LK-TODO: this needs to be receiver/mime aware
-			t.params.Telemetry.TrackStats(livekit.StreamType_UPSTREAM, t.PublisherID(), t.ID(), stat)
+			key := telemetry.StatsKeyForTrack(livekit.StreamType_UPSTREAM, t.PublisherID(), t.ID(), t.params.TrackInfo.Source, t.params.TrackInfo.Type)
+			t.params.Telemetry.TrackStats(key, stat)
 		})
 		if t.PrimaryReceiver() == nil {
 			// primary codec published, set potential codecs
@@ -277,12 +272,6 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 				t.params.Logger.Debugw("primary codec published, set potential codecs", "potential", potentialCodecs)
 				t.MediaTrackReceiver.SetPotentialCodecs(potentialCodecs, parameters.HeaderExtensions)
 			}
-			t.params.Telemetry.TrackPublished(
-				context.Background(),
-				t.PublisherID(),
-				t.PublisherIdentity(),
-				t.ToProto(),
-			)
 		}
 
 		newWR.OnMaxLayerChange(t.onMaxLayerChange)
@@ -361,6 +350,7 @@ func (t *MediaTrack) Restart() {
 }
 
 func (t *MediaTrack) Close(willBeResumed bool) {
+	t.MediaTrackReceiver.SetClosing()
 	if t.dynacastManager != nil {
 		t.dynacastManager.Close()
 	}

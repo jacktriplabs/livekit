@@ -34,7 +34,8 @@ const (
 	StreamTrackerTypePacket StreamTrackerType = "packet"
 	StreamTrackerTypeFrame  StreamTrackerType = "frame"
 
-	StatsUpdateInterval = time.Second * 10
+	StatsUpdateInterval          = time.Second * 10
+	TelemetryStatsUpdateInterval = time.Second * 30
 )
 
 var (
@@ -46,6 +47,7 @@ type Config struct {
 	Port           uint32                   `yaml:"port"`
 	BindAddresses  []string                 `yaml:"bind_addresses"`
 	PrometheusPort uint32                   `yaml:"prometheus_port,omitempty"`
+	Environment    string                   `yaml:"environment,omitempty"`
 	RTC            RTCConfig                `yaml:"rtc,omitempty"`
 	Redis          redisLiveKit.RedisConfig `yaml:"redis,omitempty"`
 	Audio          AudioConfig              `yaml:"audio,omitempty"`
@@ -81,6 +83,8 @@ type RTCConfig struct {
 	Interfaces              InterfacesConfig `yaml:"interfaces"`
 	IPs                     IPsConfig        `yaml:"ips"`
 	EnableLoopbackCandidate bool             `yaml:"enable_loopback_candidate"`
+	UseMDNS                 bool             `yaml:"use_mdns"`
+	StrictACKs              bool             `yaml:"strict_acks"`
 
 	// Number of packets to buffer for NACK
 	PacketBufferSize int `yaml:"packet_buffer_size,omitempty"`
@@ -161,7 +165,6 @@ type StreamTrackerFrameConfig struct {
 type StreamTrackerConfig struct {
 	StreamTrackerType     StreamTrackerType                   `yaml:"stream_tracker_type,omitempty"`
 	BitrateReportInterval map[int32]time.Duration             `yaml:"bitrate_report_interval,omitempty"`
-	ExemptedLayers        []int32                             `yaml:"exempted_layers,omitempty"`
 	PacketTracker         map[int32]StreamTrackerPacketConfig `yaml:"packet_tracker,omitempty"`
 	FrameTracker          map[int32]StreamTrackerFrameConfig  `yaml:"frame_tracker,omitempty"`
 }
@@ -241,7 +244,6 @@ type EgressConfig struct {
 
 type IngressConfig struct {
 	RTMPBaseURL string `yaml:"rtmp_base_url"`
-	UsePsRPC    bool   `yaml:"use_psrpc"`
 }
 
 // not exposed to YAML
@@ -272,6 +274,7 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 			ICEPortRangeEnd:   0,
 			STUNServers:       []string{},
 			PacketBufferSize:  500,
+			StrictACKs:        true,
 			PLIThrottle: PLIThrottleConfig{
 				LowQuality:  500 * time.Millisecond,
 				MidQuality:  time.Second,
@@ -299,7 +302,6 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 						1: 1 * time.Second,
 						2: 1 * time.Second,
 					},
-					ExemptedLayers: []int32{},
 					PacketTracker: map[int32]StreamTrackerPacketConfig{
 						0: StreamTrackerPacketConfig{
 							SamplesRequired: 1,
@@ -336,7 +338,6 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 						1: 4 * time.Second,
 						2: 4 * time.Second,
 					},
-					ExemptedLayers: []int32{0},
 					PacketTracker: map[int32]StreamTrackerPacketConfig{
 						0: StreamTrackerPacketConfig{
 							SamplesRequired: 1,
@@ -453,6 +454,10 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 	}
 	if conf.Logging.Level == "" && conf.Development {
 		conf.Logging.Level = "debug"
+	}
+
+	if conf.Development {
+		conf.Environment = "dev"
 	}
 
 	return conf, nil

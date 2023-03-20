@@ -37,6 +37,7 @@ type WebRTCConfig struct {
 	Publisher      DirectionConfig
 	Subscriber     DirectionConfig
 	NAT1To1IPs     []string
+	UseMDNS        bool
 }
 
 type ReceiverConfig struct {
@@ -56,6 +57,7 @@ type RTCPFeedbackConfig struct {
 type DirectionConfig struct {
 	RTPHeaderExtension RTPHeaderExtensionConfig
 	RTCPFeedback       RTCPFeedbackConfig
+	StrictACKs         bool
 }
 
 const (
@@ -88,6 +90,10 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 		}
 		ipFilter = filter
 		s.SetIPFilter(filter)
+	}
+
+	if !rtcConf.UseMDNS {
+		s.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	}
 
 	var nat1to1IPs []string
@@ -188,6 +194,7 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 
 	// publisher configuration
 	publisherConfig := DirectionConfig{
+		StrictACKs: true, // publisher is dialed, and will always reply with ACK
 		RTPHeaderExtension: RTPHeaderExtensionConfig{
 			Audio: []string{
 				sdp.SDESMidURI,
@@ -203,6 +210,9 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 			},
 		},
 		RTCPFeedback: RTCPFeedbackConfig{
+			Audio: []webrtc.RTCPFeedback{
+				{Type: webrtc.TypeRTCPFBNACK},
+			},
 			Video: []webrtc.RTCPFeedback{
 				{Type: webrtc.TypeRTCPFBTransportCC},
 				{Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
@@ -214,6 +224,7 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 
 	// subscriber configuration
 	subscriberConfig := DirectionConfig{
+		StrictACKs: conf.RTC.StrictACKs,
 		RTPHeaderExtension: RTPHeaderExtensionConfig{
 			Video: []string{dd.ExtensionUrl},
 		},
@@ -258,6 +269,7 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 		Publisher:      publisherConfig,
 		Subscriber:     subscriberConfig,
 		NAT1To1IPs:     nat1to1IPs,
+		UseMDNS:        rtcConf.UseMDNS,
 	}, nil
 }
 
