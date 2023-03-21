@@ -293,6 +293,11 @@ func (m *SubscriptionManager) reconcileSubscription(s *trackSubscription) {
 				if s.durationSinceStart() > subscriptionTimeout {
 					s.maybeRecordError(m.params.Telemetry, m.params.Participant.ID(), err, true)
 				}
+			case ErrTrackNotNeeded:
+				// this error is artificial and created by us
+				// it informs SubscriptionManager that the current subscriber does not need the track from the publisher
+				s.logger.Infow("subscription to track not needed", "error", err)
+				s.setDesired(false)
 			case ErrTrackNotFound:
 				// source track was never published or closed
 				// if after timeout, we'd unsubscribe from it.

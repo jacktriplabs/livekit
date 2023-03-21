@@ -19,4 +19,5 @@ var (
 	ErrTrackNotFound         = errors.New("track cannot be found")
 	ErrTrackNotAttached      = errors.New("track is not yet attached")
 	ErrTrackNotBound         = errors.New("track not bound")
+	ErrTrackNotNeeded        = errors.New("track not needed")
 )
