@@ -91,17 +91,17 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 	if sub.Identity() == "livekit-bridge" {
 		if t.params.MediaTrack.Kind() == livekit.TrackType_VIDEO {
 			t.params.Logger.Infow("livekit-bridge does not need to subscribe to video tracks")
-			return nil, nil
+			return nil, ErrTrackNotNeeded
 		}
 	} else {
 		if t.params.MediaTrack.Kind() == livekit.TrackType_AUDIO {
 			if t.params.MediaTrack.PublisherIdentity() != "livekit-bridge" {
 				t.params.Logger.Infow("Not allowed to subscribe to non livekit-bridge track")
-				return nil, nil
+				return nil, ErrTrackNotNeeded
 			}
 			if t.params.MediaTrack.Name() != string(sub.Identity()) {
 				t.params.Logger.Infow("Not allowed to subscribe to another user track")
-				return nil, nil
+				return nil, ErrTrackNotNeeded
 			}
 		}
 	}
