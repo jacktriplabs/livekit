@@ -224,10 +224,15 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 				}
 			}
 
-			if ti == nil || (ti.DisableDtx && !ti.Stereo) {
-				// no need to configure
-				continue
-			}
+			m.Attributes = append(m.Attributes, sdp.Attribute{Key: "ptime", Value: "5"})
+			m.Attributes = append(m.Attributes, sdp.Attribute{Key: "maxptime", Value: "10"})
+
+			/*
+				if ti == nil || (ti.DisableDtx && !ti.Stereo) {
+					// no need to configure
+					continue
+				}
+			*/
 
 			opusPT, err := parsed.GetPayloadTypeForCodec(sdp.Codec{Name: "opus"})
 			if err != nil {
@@ -237,12 +242,15 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 
 			for i, attr := range m.Attributes {
 				if strings.HasPrefix(attr.String(), fmt.Sprintf("fmtp:%d", opusPT)) {
-					if !ti.DisableDtx {
-						attr.Value += ";usedtx=1"
-					}
-					if ti.Stereo {
-						attr.Value += ";stereo=1;maxaveragebitrate=510000"
-					}
+					attr.Value = fmt.Sprintf(":%d ptime=5;maxptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;usedtx=0;maxaveragebitrate=327680", opusPT)
+					/*
+						if !ti.DisableDtx {
+							attr.Value += ";usedtx=1"
+						}
+						if ti.Stereo {
+							attr.Value += ";stereo=1;maxaveragebitrate=510000"
+						}
+					*/
 					m.Attributes[i] = attr
 				}
 			}
