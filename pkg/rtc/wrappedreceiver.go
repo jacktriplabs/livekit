@@ -103,6 +103,14 @@ func (r *WrappedReceiver) Codecs() []webrtc.RTPCodecParameters {
 	return codecs
 }
 
+func (r *WrappedReceiver) DeleteDownTrack(participantID livekit.ParticipantID) {
+	if r.TrackReceiver != nil {
+		r.TrackReceiver.DeleteDownTrack(participantID)
+	}
+}
+
+// --------------------------------------------
+
 type DummyReceiver struct {
 	receiver         atomic.Value
 	trackID          livekit.TrackID
@@ -259,13 +267,6 @@ func (d *DummyReceiver) DebugInfo() map[string]interface{} {
 	return nil
 }
 
-func (d *DummyReceiver) GetLayerDimension(quality int32) (uint32, uint32) {
-	if r, ok := d.receiver.Load().(sfu.TrackReceiver); ok {
-		return r.GetLayerDimension(quality)
-	}
-	return 0, 0
-}
-
 func (d *DummyReceiver) GetTemporalLayerFpsForSpatial(spatial int32) []float32 {
 	if r, ok := d.receiver.Load().(sfu.TrackReceiver); ok {
 		return r.GetTemporalLayerFpsForSpatial(spatial)
@@ -296,11 +297,11 @@ func (d *DummyReceiver) GetRedReceiver() sfu.TrackReceiver {
 	return d
 }
 
-func (d *DummyReceiver) GetRTCPSenderReportDataExt(layer int32) *buffer.RTCPSenderReportDataExt {
+func (d *DummyReceiver) GetRTCPSenderReportData(layer int32) (*buffer.RTCPSenderReportData, *buffer.RTCPSenderReportData) {
 	if r, ok := d.receiver.Load().(sfu.TrackReceiver); ok {
-		return r.GetRTCPSenderReportDataExt(layer)
+		return r.GetRTCPSenderReportData(layer)
 	}
-	return nil
+	return nil, nil
 }
 
 func (d *DummyReceiver) GetReferenceLayerRTPTimestamp(ts uint32, layer int32, referenceLayer int32) (uint32, error) {

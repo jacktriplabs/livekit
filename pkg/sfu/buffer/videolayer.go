@@ -11,9 +11,14 @@ const (
 )
 
 var (
-	InvalidLayers = VideoLayer{
+	InvalidLayer = VideoLayer{
 		Spatial:  InvalidLayerSpatial,
 		Temporal: InvalidLayerTemporal,
+	}
+
+	DefaultMaxLayer = VideoLayer{
+		Spatial:  DefaultMaxLayerSpatial,
+		Temporal: DefaultMaxLayerTemporal,
 	}
 )
 

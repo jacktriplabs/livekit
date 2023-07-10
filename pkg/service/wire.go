@@ -18,7 +18,6 @@ import (
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/protocol/auth"
-	"github.com/livekit/protocol/egress"
 	"github.com/livekit/protocol/livekit"
 	redisLiveKit "github.com/livekit/protocol/redis"
 	"github.com/livekit/protocol/rpc"
@@ -45,8 +44,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		telemetry.NewTelemetryService,
 		getMessageBus,
 		NewIOInfoService,
-		getEgressClient,
-		egress.NewRedisRPCClient,
+		rpc.NewEgressClient,
 		getEgressStore,
 		NewEgressLauncher,
 		NewEgressService,
@@ -57,6 +55,9 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		NewRoomAllocator,
 		NewRoomService,
 		NewRTCService,
+		getSignalRelayConfig,
+		NewDefaultSignalServer,
+		routing.NewSignalClient,
 		NewLocalRoomManager,
 		newTurnAuthHandler,
 		newInProcessTurnServer,
@@ -69,6 +70,10 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routing.Router, error) {
 	wire.Build(
 		createRedisClient,
+		getNodeID,
+		getMessageBus,
+		getSignalRelayConfig,
+		routing.NewSignalClient,
 		routing.CreateRouter,
 	)
 
@@ -107,7 +112,7 @@ func createKeyProvider(conf *config.Config) (auth.KeyProvider, error) {
 	return auth.NewFileBasedKeyProviderFromMap(conf.Keys), nil
 }
 
-func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webhook.Notifier, error) {
+func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webhook.QueuedNotifier, error) {
 	wc := conf.WebHook
 	if len(wc.URLs) == 0 {
 		return nil, nil
@@ -117,7 +122,7 @@ func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webh
 		return nil, ErrWebHookMissingAPIKey
 	}
 
-	return webhook.NewNotifier(wc.APIKey, secret, wc.URLs), nil
+	return webhook.NewDefaultNotifier(wc.APIKey, secret, wc.URLs), nil
 }
 
 func createRedisClient(conf *config.Config) (redis.UniversalClient, error) {
@@ -136,17 +141,9 @@ func createStore(rc redis.UniversalClient) ObjectStore {
 
 func getMessageBus(rc redis.UniversalClient) psrpc.MessageBus {
 	if rc == nil {
-		return nil
+		return psrpc.NewLocalMessageBus()
 	}
 	return psrpc.NewRedisMessageBus(rc)
-}
-
-func getEgressClient(conf *config.Config, nodeID livekit.NodeID, bus psrpc.MessageBus) (rpc.EgressClient, error) {
-	if conf.Egress.UsePsRPC {
-		return rpc.NewEgressClient(nodeID, bus)
-	}
-
-	return nil, nil
 }
 
 func getEgressStore(s ObjectStore) EgressStore {
@@ -177,6 +174,10 @@ func createClientConfiguration() clientconfiguration.ClientConfigurationManager 
 
 func getRoomConf(config *config.Config) config.RoomConfig {
 	return config.Room
+}
+
+func getSignalRelayConfig(config *config.Config) config.SignalRelayConfig {
+	return config.SignalRelay
 }
 
 func newInProcessTurnServer(conf *config.Config, authHandler turn.AuthHandler) (*turn.Server, error) {

@@ -5,8 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gammazero/workerpool"
-
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -24,8 +22,8 @@ type TelemetryService interface {
 	// ParticipantJoined - a participant establishes signal connection to a room
 	ParticipantJoined(ctx context.Context, room *livekit.Room, participant *livekit.ParticipantInfo, clientInfo *livekit.ClientInfo, clientMeta *livekit.AnalyticsClientMeta, shouldSendEvent bool)
 	// ParticipantActive - a participant establishes media connection
-	ParticipantActive(ctx context.Context, room *livekit.Room, participant *livekit.ParticipantInfo, clientMeta *livekit.AnalyticsClientMeta)
-	// ParticipantResumed - there has been an ICE restart or connection resume attempt
+	ParticipantActive(ctx context.Context, room *livekit.Room, participant *livekit.ParticipantInfo, clientMeta *livekit.AnalyticsClientMeta, isMigration bool)
+	// ParticipantResumed - there has been an ICE restart or connection resume attempt, and we've received their signal connection
 	ParticipantResumed(ctx context.Context, room *livekit.Room, participant *livekit.ParticipantInfo, nodeID livekit.NodeID, reason livekit.ReconnectReason)
 	// ParticipantLeft - the participant leaves the room, only sent if ParticipantActive has been called before
 	ParticipantLeft(ctx context.Context, room *livekit.Room, participant *livekit.ParticipantInfo, shouldSendEvent bool)
@@ -51,8 +49,16 @@ type TelemetryService interface {
 	TrackPublishedUpdate(ctx context.Context, participantID livekit.ParticipantID, track *livekit.TrackInfo)
 	// TrackMaxSubscribedVideoQuality - publisher is notified of the max quality subscribers desire
 	TrackMaxSubscribedVideoQuality(ctx context.Context, participantID livekit.ParticipantID, track *livekit.TrackInfo, mime string, maxQuality livekit.VideoQuality)
+	TrackPublishRTPStats(ctx context.Context, participantID livekit.ParticipantID, trackID livekit.TrackID, mimeType string, layer int, stats *livekit.RTPStats)
+	TrackSubscribeRTPStats(ctx context.Context, participantID livekit.ParticipantID, trackID livekit.TrackID, mimeType string, stats *livekit.RTPStats)
 	EgressStarted(ctx context.Context, info *livekit.EgressInfo)
+	EgressUpdated(ctx context.Context, info *livekit.EgressInfo)
 	EgressEnded(ctx context.Context, info *livekit.EgressInfo)
+	IngressCreated(ctx context.Context, info *livekit.IngressInfo)
+	IngressDeleted(ctx context.Context, info *livekit.IngressInfo)
+	IngressStarted(ctx context.Context, info *livekit.IngressInfo)
+	IngressUpdated(ctx context.Context, info *livekit.IngressInfo)
+	IngressEnded(ctx context.Context, info *livekit.IngressInfo)
 
 	// helpers
 	AnalyticsService
@@ -61,7 +67,6 @@ type TelemetryService interface {
 }
 
 const (
-	maxWebhookWorkers  = 50
 	workerCleanupWait  = 3 * time.Minute
 	jobQueueBufferSize = 10000
 )
@@ -69,22 +74,20 @@ const (
 type telemetryService struct {
 	AnalyticsService
 
-	notifier    webhook.Notifier
-	webhookPool *workerpool.WorkerPool
-	jobsChan    chan func()
+	notifier webhook.QueuedNotifier
+	jobsChan chan func()
 
 	lock    sync.RWMutex
 	workers map[livekit.ParticipantID]*StatsWorker
 }
 
-func NewTelemetryService(notifier webhook.Notifier, analytics AnalyticsService) TelemetryService {
+func NewTelemetryService(notifier webhook.QueuedNotifier, analytics AnalyticsService) TelemetryService {
 	t := &telemetryService{
 		AnalyticsService: analytics,
 
-		notifier:    notifier,
-		webhookPool: workerpool.New(maxWebhookWorkers),
-		jobsChan:    make(chan func(), jobQueueBufferSize),
-		workers:     make(map[livekit.ParticipantID]*StatsWorker),
+		notifier: notifier,
+		jobsChan: make(chan func(), jobQueueBufferSize),
+		workers:  make(map[livekit.ParticipantID]*StatsWorker),
 	}
 
 	go t.run()

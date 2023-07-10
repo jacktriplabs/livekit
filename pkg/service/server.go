@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
 	"github.com/pion/turn/v2"
@@ -28,18 +30,19 @@ import (
 )
 
 type LivekitServer struct {
-	config      *config.Config
-	ioService   *IOInfoService
-	rtcService  *RTCService
-	httpServer  *http.Server
-	promServer  *http.Server
-	router      routing.Router
-	roomManager *RoomManager
-	turnServer  *turn.Server
-	currentNode routing.LocalNode
-	running     atomic.Bool
-	doneChan    chan struct{}
-	closedChan  chan struct{}
+	config       *config.Config
+	ioService    *IOInfoService
+	rtcService   *RTCService
+	httpServer   *http.Server
+	promServer   *http.Server
+	router       routing.Router
+	roomManager  *RoomManager
+	signalServer *SignalServer
+	turnServer   *turn.Server
+	currentNode  routing.LocalNode
+	running      atomic.Bool
+	doneChan     chan struct{}
+	closedChan   chan struct{}
 }
 
 func NewLivekitServer(conf *config.Config,
@@ -51,15 +54,17 @@ func NewLivekitServer(conf *config.Config,
 	keyProvider auth.KeyProvider,
 	router routing.Router,
 	roomManager *RoomManager,
+	signalServer *SignalServer,
 	turnServer *turn.Server,
 	currentNode routing.LocalNode,
 ) (s *LivekitServer, err error) {
 	s = &LivekitServer{
-		config:      conf,
-		ioService:   ioService,
-		rtcService:  rtcService,
-		router:      router,
-		roomManager: roomManager,
+		config:       conf,
+		ioService:    ioService,
+		rtcService:   rtcService,
+		router:       router,
+		roomManager:  roomManager,
+		signalServer: signalServer,
 		// turn server starts automatically
 		turnServer:  turnServer,
 		currentNode: currentNode,
@@ -173,14 +178,14 @@ func (s *LivekitServer) Start() error {
 	listeners := make([]net.Listener, 0)
 	promListeners := make([]net.Listener, 0)
 	for _, addr := range addresses {
-		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", addr, s.config.Port))
+		ln, err := net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(int(s.config.Port))))
 		if err != nil {
 			return err
 		}
 		listeners = append(listeners, ln)
 
 		if s.promServer != nil {
-			ln, err = net.Listen("tcp", fmt.Sprintf("%s:%d", addr, s.config.PrometheusPort))
+			ln, err = net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(int(s.config.PrometheusPort))))
 			if err != nil {
 				return err
 			}
@@ -214,6 +219,9 @@ func (s *LivekitServer) Start() error {
 		values = append(values, "region", s.config.Region)
 	}
 	logger.Infow("starting LiveKit server", values...)
+	if runtime.GOOS == "windows" {
+		logger.Infow("Windows detected, capacity management is unavailable")
+	}
 
 	for _, promLn := range promListeners {
 		go s.promServer.Serve(promLn)
@@ -252,6 +260,7 @@ func (s *LivekitServer) Start() error {
 	}
 
 	s.roomManager.Stop()
+	s.signalServer.Stop()
 	s.ioService.Stop()
 
 	close(s.closedChan)

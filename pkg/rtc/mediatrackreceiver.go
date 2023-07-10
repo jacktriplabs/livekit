@@ -15,9 +15,11 @@ import (
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
+	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
+	"github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
@@ -53,7 +55,7 @@ func (m mediaTrackReceiverState) String() string {
 	}
 }
 
-//-----------------------------------------------------
+// -----------------------------------------------------
 
 type simulcastReceiver struct {
 	sfu.TrackReceiver
@@ -74,6 +76,7 @@ type MediaTrackReceiverParams struct {
 	ParticipantVersion  uint32
 	ReceiverConfig      ReceiverConfig
 	SubscriberConfig    DirectionConfig
+	AudioConfig         config.AudioConfig
 	Telemetry           telemetry.TelemetryService
 	Logger              logger.Logger
 }
@@ -83,14 +86,13 @@ type MediaTrackReceiver struct {
 	muted       atomic.Bool
 	simulcasted atomic.Bool
 
-	lock               sync.RWMutex
-	receivers          []*simulcastReceiver
-	receiversShadow    []*simulcastReceiver
-	trackInfo          *livekit.TrackInfo
-	layerDimensions    map[livekit.VideoQuality]*livekit.VideoLayer
-	potentialCodecs    []webrtc.RTPCodecParameters
-	pendingSubscribeOp map[livekit.ParticipantID]int
-	state              mediaTrackReceiverState
+	lock            sync.RWMutex
+	receivers       []*simulcastReceiver
+	receiversShadow []*simulcastReceiver
+	trackInfo       *livekit.TrackInfo
+	layerDimensions map[livekit.VideoQuality]*livekit.VideoLayer
+	potentialCodecs []webrtc.RTPCodecParameters
+	state           mediaTrackReceiverState
 
 	onSetupReceiver     func(mime string)
 	onMediaLossFeedback func(dt *sfu.DownTrack, report *rtcp.ReceiverReport)
@@ -102,11 +104,10 @@ type MediaTrackReceiver struct {
 
 func NewMediaTrackReceiver(params MediaTrackReceiverParams) *MediaTrackReceiver {
 	t := &MediaTrackReceiver{
-		params:             params,
-		trackInfo:          proto.Clone(params.TrackInfo).(*livekit.TrackInfo),
-		layerDimensions:    make(map[livekit.VideoQuality]*livekit.VideoLayer),
-		pendingSubscribeOp: make(map[livekit.ParticipantID]int),
-		state:              mediaTrackReceiverStateOpen,
+		params:          params,
+		trackInfo:       proto.Clone(params.TrackInfo).(*livekit.TrackInfo),
+		layerDimensions: make(map[livekit.VideoQuality]*livekit.VideoLayer),
+		state:           mediaTrackReceiverStateOpen,
 	}
 
 	t.MediaTrackSubscriptions = NewMediaTrackSubscriptions(MediaTrackSubscriptionsParams{
@@ -206,6 +207,15 @@ func (t *MediaTrackReceiver) SetupReceiver(receiver sfu.TrackReceiver, priority 
 }
 
 func (t *MediaTrackReceiver) SetPotentialCodecs(codecs []webrtc.RTPCodecParameters, headers []webrtc.RTPHeaderExtensionParameter) {
+	// The potential codecs have not published yet, so we can't get the actual Extensions, the client/browser uses same extensions
+	// for all video codecs so we assume they will have same extensions as the primary codec except for the dependency descriptor
+	// that is munged in svc codec.
+	headersWithoutDD := make([]webrtc.RTPHeaderExtensionParameter, 0, len(headers))
+	for _, h := range headers {
+		if h.URI != dependencydescriptor.ExtensionUrl {
+			headersWithoutDD = append(headersWithoutDD, h)
+		}
+	}
 	t.lock.Lock()
 	t.potentialCodecs = codecs
 	for i, c := range codecs {
@@ -217,8 +227,12 @@ func (t *MediaTrackReceiver) SetPotentialCodecs(codecs []webrtc.RTPCodecParamete
 			}
 		}
 		if !exist {
+			extHeaders := headers
+			if !sfu.IsSvcCodec(c.MimeType) {
+				extHeaders = headersWithoutDD
+			}
 			t.receivers = append(t.receivers, &simulcastReceiver{
-				TrackReceiver: NewDummyReceiver(livekit.TrackID(t.trackInfo.Sid), string(t.PublisherID()), c, headers),
+				TrackReceiver: NewDummyReceiver(livekit.TrackID(t.trackInfo.Sid), string(t.PublisherID()), c, extHeaders),
 				priority:      i,
 			})
 		}
@@ -240,7 +254,7 @@ func (t *MediaTrackReceiver) SetLayerSsrc(mime string, rid string, ssrc uint32) 
 	defer t.lock.Unlock()
 
 	layer := buffer.RidToSpatialLayer(rid, t.params.TrackInfo)
-	if layer == sfu.InvalidLayerSpatial {
+	if layer == buffer.InvalidLayerSpatial {
 		// non-simulcast case will not have `rid`
 		layer = 0
 	}
@@ -310,7 +324,6 @@ func (t *MediaTrackReceiver) IsOpen() bool {
 }
 
 func (t *MediaTrackReceiver) SetClosing() {
-	t.params.Logger.Infow("setting track to closing")
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	if t.state == mediaTrackReceiverStateOpen {
@@ -474,7 +487,7 @@ func (t *MediaTrackReceiver) AddSubscriber(sub types.LocalParticipant) (types.Su
 		StreamId:       streamId,
 		UpstreamCodecs: potentialCodecs,
 		Logger:         tLogger,
-		DisableRed:     t.trackInfo.GetDisableRed(),
+		DisableRed:     t.trackInfo.GetDisableRed() || !t.params.AudioConfig.ActiveREDEncoding,
 	})
 	return t.MediaTrackSubscriptions.AddSubscriber(sub, wr)
 }
@@ -668,11 +681,13 @@ func (t *MediaTrackReceiver) GetQualityForDimension(width, height uint32) liveki
 		})
 	}
 
-	// finds the lowest layer that could satisfy client demands
+	// finds the highest layer with smallest dimensions that still satisfy client demands
 	requestedSize = uint32(float32(requestedSize) * layerSelectionTolerance)
 	for i, s := range layerSizes {
 		quality = livekit.VideoQuality(i)
-		if s >= requestedSize {
+		if i == len(layerSizes)-1 {
+			break
+		} else if s >= requestedSize && s != layerSizes[i+1] {
 			break
 		}
 	}

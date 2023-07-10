@@ -88,7 +88,7 @@ func (d *DynacastManager) Close() {
 	}
 }
 
-// THere are situations like track unmute or streaming from a sifferent node
+// THere are situations like track unmute or streaming from a different node
 // where subscribed quality needs to sent to the provider immediately.
 // This bypasses any debouncing and forces a subscribed quality update
 // with immediate effect.
@@ -140,9 +140,8 @@ func (d *DynacastManager) getOrCreateDynacastQuality(mime string) *DynacastQuali
 	}
 
 	dq := NewDynacastQuality(DynacastQualityParams{
-		MimeType:           mime,
-		DynacastPauseDelay: d.params.DynacastPauseDelay,
-		Logger:             d.params.Logger,
+		MimeType: mime,
+		Logger:   d.params.Logger,
 	})
 	dq.OnSubscribedMaxQualityChange(func(maxQuality livekit.VideoQuality) {
 		d.updateMaxQualityForMime(mime, maxQuality)

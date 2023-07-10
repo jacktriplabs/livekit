@@ -21,7 +21,7 @@ func newMockParticipant(identity livekit.ParticipantIdentity, protocol types.Pro
 	p.StateReturns(livekit.ParticipantInfo_JOINED)
 	p.ProtocolVersionReturns(protocol)
 	p.CanSubscribeReturns(true)
-	p.CanPublishReturns(!hidden)
+	p.CanPublishSourceReturns(!hidden)
 	p.CanPublishDataReturns(!hidden)
 	p.HiddenReturns(hidden)
 	p.ToProtoReturns(&livekit.ParticipantInfo{
@@ -31,7 +31,7 @@ func newMockParticipant(identity livekit.ParticipantIdentity, protocol types.Pro
 		IsPublisher: publisher,
 	})
 
-	p.SetMetadataStub = func(m string) {
+	p.SetMetadataCalls(func(m string) {
 		var f func(participant types.LocalParticipant)
 		if p.OnParticipantUpdateCallCount() > 0 {
 			f = p.OnParticipantUpdateArgsForCall(p.OnParticipantUpdateCallCount() - 1)
@@ -39,7 +39,7 @@ func newMockParticipant(identity livekit.ParticipantIdentity, protocol types.Pro
 		if f != nil {
 			f(p)
 		}
-	}
+	})
 	updateTrack := func() {
 		var f func(participant types.LocalParticipant, track types.MediaTrack)
 		if p.OnTrackUpdatedCallCount() > 0 {
@@ -50,12 +50,12 @@ func newMockParticipant(identity livekit.ParticipantIdentity, protocol types.Pro
 		}
 	}
 
-	p.SetTrackMutedStub = func(sid livekit.TrackID, muted bool, fromServer bool) {
+	p.SetTrackMutedCalls(func(sid livekit.TrackID, muted bool, fromServer bool) {
 		updateTrack()
-	}
-	p.AddTrackStub = func(req *livekit.AddTrackRequest) {
+	})
+	p.AddTrackCalls(func(req *livekit.AddTrackRequest) {
 		updateTrack()
-	}
+	})
 
 	return p
 }

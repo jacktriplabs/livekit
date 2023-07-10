@@ -123,6 +123,7 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 		sub.GetBufferFactory(),
 		subscriberID,
 		t.params.ReceiverConfig.PacketBufferSize,
+		sub.GetPacer(),
 		LoggerWithTrack(sub.GetLogger(), trackID, t.params.IsRelayed),
 	)
 	if err != nil {
@@ -146,7 +147,11 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 	// Bind callback can happen from replaceTrack, so set it up early
 	var reusingTransceiver atomic.Bool
 	var dtState sfu.DownTrackState
-	downTrack.OnBinding(func() {
+	downTrack.OnBinding(func(err error) {
+		if err != nil {
+			go subTrack.Bound(err)
+			return
+		}
 		wr.DetermineReceiver(downTrack.Codec())
 		if reusingTransceiver.Load() {
 			downTrack.SeedState(dtState)
@@ -160,7 +165,7 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 			)
 		}
 
-		go subTrack.Bound()
+		go subTrack.Bound(nil)
 
 		subTrack.SetPublisherMuted(t.params.MediaTrack.IsMuted())
 	})
@@ -224,6 +229,10 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 			Stereo: info.Stereo,
 			Red:    !info.DisableRed,
 		}
+		if addTrackParams.Red && (len(codecs) == 1 && codecs[0].MimeType == webrtc.MimeTypeOpus) {
+			addTrackParams.Red = false
+		}
+
 		sub.VerifySubscribeParticipantInfo(subTrack.PublisherID(), subTrack.PublisherVersion())
 		if sub.ProtocolVersion().SupportsTransceiverReuse() {
 			//
