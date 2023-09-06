@@ -10,7 +10,7 @@ import (
 func HandleParticipantSignal(room types.Room, participant types.LocalParticipant, req *livekit.SignalRequest, pLogger logger.Logger) error {
 	participant.UpdateLastSeenSignal()
 
-	switch msg := req.Message.(type) {
+	switch msg := req.GetMessage().(type) {
 	case *livekit.SignalRequest_Offer:
 		participant.HandleOffer(FromProtoSessionDescription(msg.Offer))
 	case *livekit.SignalRequest_Answer:
@@ -72,6 +72,11 @@ func HandleParticipantSignal(room types.Room, participant types.LocalParticipant
 	case *livekit.SignalRequest_PingReq:
 		if msg.PingReq.Rtt > 0 {
 			participant.UpdateSignalingRTT(uint32(msg.PingReq.Rtt))
+		}
+
+	case *livekit.SignalRequest_UpdateMetadata:
+		if participant.ClaimGrants().Video.GetCanUpdateOwnMetadata() {
+			room.UpdateParticipantMetadata(participant, msg.UpdateMetadata.Name, msg.UpdateMetadata.Metadata)
 		}
 	}
 	return nil

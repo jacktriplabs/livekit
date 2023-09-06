@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bep/debounce"
+	"github.com/pion/dtls/v2/pkg/crypto/elliptic"
 	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/cc"
@@ -21,12 +22,13 @@ import (
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/logger/pionlogger"
 	lksdp "github.com/livekit/protocol/sdp"
 
 	"github.com/livekit/livekit-server/pkg/config"
-	serverlogger "github.com/livekit/livekit-server/pkg/logger"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
-	"github.com/livekit/livekit-server/pkg/sfu"
+	"github.com/livekit/livekit-server/pkg/sfu/pacer"
+	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
@@ -46,6 +48,7 @@ const (
 	minTcpICEConnectTimeout = 5 * time.Second
 	maxTcpICEConnectTimeout = 12 * time.Second // js-sdk has a default 15s timeout for first connection, let server detect failure earlier before that
 
+	minConnectTimeoutAfterICE = 10 * time.Second
 	maxConnectTimeoutAfterICE = 20 * time.Second // max duration for waiting pc to connect after ICE is connected
 
 	shortConnectionThreshold = 90 * time.Second
@@ -181,7 +184,10 @@ type PCTransport struct {
 	onNegotiationFailed       func()
 
 	// stream allocator for subscriber PC
-	streamAllocator *sfu.StreamAllocator
+	streamAllocator *streamallocator.StreamAllocator
+
+	// only for subscriber PC
+	pacer pacer.Pacer
 
 	previousAnswer *webrtc.SessionDescription
 	// track id -> description map in previous offer sdp
@@ -230,15 +236,17 @@ type TransportParams struct {
 }
 
 func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimator cc.BandwidthEstimator)) (*webrtc.PeerConnection, *webrtc.MediaEngine, error) {
-	directionConfig := params.DirectionConfig
-
-	me, err := createMediaEngine(params.EnabledCodecs, directionConfig)
+	me, err := createMediaEngine(params.EnabledCodecs, params.DirectionConfig)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	se := params.Config.SettingEngine
 	se.DisableMediaEngineCopy(true)
+
+	// Change elliptic curve to improve connectivity
+	// https://github.com/pion/dtls/pull/474
+	se.SetDTLSEllipticCurves(elliptic.X25519, elliptic.P384, elliptic.P256)
 
 	//
 	// Disable SRTP replay protection (https://datatracker.ietf.org/doc/html/rfc3711#page-15).
@@ -292,28 +300,14 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 		}
 	}
 
-	lf := serverlogger.NewLoggerFactory(params.Logger)
+	lf := pionlogger.NewLoggerFactory(params.Logger)
 	if lf != nil {
 		se.LoggerFactory = lf
 	}
 
 	ir := &interceptor.Registry{}
 	if params.IsSendSide {
-		isSendSideBWE := false
-		for _, ext := range directionConfig.RTPHeaderExtension.Video {
-			if ext == sdp.TransportCCURI {
-				isSendSideBWE = true
-				break
-			}
-		}
-		for _, ext := range directionConfig.RTPHeaderExtension.Audio {
-			if ext == sdp.TransportCCURI {
-				isSendSideBWE = true
-				break
-			}
-		}
-
-		if isSendSideBWE {
+		if params.CongestionControlConfig.UseSendSideBWE {
 			gf, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 				return gcc.NewSendSideBWE(
 					gcc.SendSideBWEInitialBitrate(1*1000*1000),
@@ -365,11 +359,12 @@ func NewPCTransport(params TransportParams) (*PCTransport, error) {
 		canReuseTransceiver:      true,
 	}
 	if params.IsSendSide {
-		t.streamAllocator = sfu.NewStreamAllocator(sfu.StreamAllocatorParams{
+		t.streamAllocator = streamallocator.NewStreamAllocator(streamallocator.StreamAllocatorParams{
 			Config: params.CongestionControlConfig,
 			Logger: params.Logger,
 		})
 		t.streamAllocator.Start()
+		t.pacer = pacer.NewPassThrough(params.Logger)
 	}
 
 	if err := t.createPeerConnection(); err != nil {
@@ -406,6 +401,10 @@ func (t *PCTransport) createPeerConnection() error {
 	}
 
 	return nil
+}
+
+func (t *PCTransport) GetPacer() pacer.Pacer {
+	return t.pacer
 }
 
 func (t *PCTransport) SetSignalingRTT(rtt uint32) {
@@ -451,8 +450,7 @@ func (t *PCTransport) setICEConnectedAt(at time.Time) {
 
 		// set failure timer for dtls handshake
 		iceDuration := at.Sub(t.iceStartedAt)
-		// let ice has chance to become disconnected if user close/refresh client app before transport full connected.
-		connTimeoutAfterICE := iceDisconnectedTimeout + time.Second + iceDuration
+		connTimeoutAfterICE := minConnectTimeoutAfterICE
 		if connTimeoutAfterICE < 3*iceDuration {
 			connTimeoutAfterICE = 3 * iceDuration
 		}
@@ -462,10 +460,8 @@ func (t *PCTransport) setICEConnectedAt(at time.Time) {
 		t.params.Logger.Debugw("setting connection timer after ice connected", "timeout", connTimeoutAfterICE, "iceDuration", iceDuration)
 		t.connectAfterICETimer = time.AfterFunc(connTimeoutAfterICE, func() {
 			state := t.pc.ConnectionState()
-			iceState := t.pc.ICEConnectionState()
-			// if ice connected, pc is still checking or connected but not fully established after timeout, then fire connection fail
-			if iceState == webrtc.ICEConnectionStateConnected && state != webrtc.PeerConnectionStateClosed &&
-				state != webrtc.PeerConnectionStateFailed && !t.isFullyEstablished() {
+			// if pc is still checking or connected but not fully established after timeout, then fire connection fail
+			if state != webrtc.PeerConnectionStateClosed && state != webrtc.PeerConnectionStateFailed && !t.isFullyEstablished() {
 				t.params.Logger.Infow("connect timeout after ICE connected", "timeout", connTimeoutAfterICE, "iceDuration", iceDuration)
 				t.handleConnectionFailed(false)
 			}
@@ -497,7 +493,7 @@ func (t *PCTransport) resetShortConn() {
 	t.lock.Unlock()
 }
 
-func (t *PCTransport) isShortConnection(at time.Time) (bool, time.Duration) {
+func (t *PCTransport) IsShortConnection(at time.Time) (bool, time.Duration) {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 
@@ -570,7 +566,7 @@ func (t *PCTransport) handleConnectionFailed(forceShortConn bool) {
 	isShort := forceShortConn
 	if !isShort {
 		var duration time.Duration
-		isShort, duration = t.isShortConnection(time.Now())
+		isShort, duration = t.IsShortConnection(time.Now())
 		if isShort {
 			pair, err := t.getSelectedPair()
 			if err != nil {
@@ -616,6 +612,7 @@ func (t *PCTransport) onPeerConnectionStateChange(state webrtc.PeerConnectionSta
 			}
 
 			t.maybeNotifyFullyEstablished()
+			t.logICECandidates()
 		}
 	case webrtc.PeerConnectionStateFailed:
 		t.params.Logger.Infow("peer connection failed")
@@ -895,6 +892,9 @@ func (t *PCTransport) Close() {
 	if t.streamAllocator != nil {
 		t.streamAllocator.Stop()
 	}
+	if t.pacer != nil {
+		t.pacer.Stop()
+	}
 
 	_ = t.pc.Close()
 
@@ -1087,7 +1087,7 @@ func (t *PCTransport) ResetShortConnOnICERestart() {
 	t.resetShortConnOnICERestart.Store(true)
 }
 
-func (t *PCTransport) OnStreamStateChange(f func(update *sfu.StreamStateUpdate) error) {
+func (t *PCTransport) OnStreamStateChange(f func(update *streamallocator.StreamStateUpdate) error) {
 	if t.streamAllocator == nil {
 		return
 	}
@@ -1100,7 +1100,7 @@ func (t *PCTransport) AddTrackToStreamAllocator(subTrack types.SubscribedTrack) 
 		return
 	}
 
-	t.streamAllocator.AddTrack(subTrack.DownTrack(), sfu.AddTrackParams{
+	t.streamAllocator.AddTrack(subTrack.DownTrack(), streamallocator.AddTrackParams{
 		Source:      subTrack.MediaTrack().Source(),
 		IsSimulcast: subTrack.MediaTrack().IsSimulcast(),
 		PublisherID: subTrack.MediaTrack().PublisherID(),
@@ -1113,6 +1113,22 @@ func (t *PCTransport) RemoveTrackFromStreamAllocator(subTrack types.SubscribedTr
 	}
 
 	t.streamAllocator.RemoveTrack(subTrack.DownTrack())
+}
+
+func (t *PCTransport) SetAllowPauseOfStreamAllocator(allowPause bool) {
+	if t.streamAllocator == nil {
+		return
+	}
+
+	t.streamAllocator.SetAllowPause(allowPause)
+}
+
+func (t *PCTransport) SetChannelCapacityOfStreamAllocator(channelCapacity int64) {
+	if t.streamAllocator == nil {
+		return
+	}
+
+	t.streamAllocator.SetChannelCapacity(channelCapacity)
 }
 
 func (t *PCTransport) GetICEConnectionType() types.ICEConnectionType {
@@ -1265,7 +1281,7 @@ func (t *PCTransport) initPCWithPreviousAnswer(previousAnswer webrtc.SessionDesc
 		}
 		tr.SetMid(mid)
 
-		// save mid -> senders for migration resue
+		// save mid -> senders for migration reuse
 		sender := tr.Sender()
 		senders[mid] = sender
 
@@ -1296,7 +1312,7 @@ func (t *PCTransport) SetPreviousSdp(offer, answer *webrtc.SessionDescription) {
 			}
 			return
 		} else if offer != nil {
-			// in migration case, can't reuse tranceiver before negotiated except track subscribed at previous node
+			// in migration case, can't reuse transceiver before negotiated except track subscribed at previous node
 			t.canReuseTransceiver = false
 			if err := t.parseTrackMid(*offer, senders); err != nil {
 				t.params.Logger.Errorw("parse previous offer failed", err, "offer", offer.SDP)
@@ -1320,12 +1336,12 @@ func (t *PCTransport) parseTrackMid(offer webrtc.SessionDescription, senders map
 		}
 
 		if split := strings.Split(msid, " "); len(split) == 2 {
-			trackid := split[1]
+			trackID := split[1]
 			mid := lksdp.GetMidValue(m)
 			if mid == "" {
 				return ErrMidNotFound
 			}
-			t.previousTrackDescription[trackid] = &trackDescription{
+			t.previousTrackDescription[trackID] = &trackDescription{
 				mid:    mid,
 				sender: senders[mid],
 			}
@@ -1351,6 +1367,11 @@ func (t *PCTransport) postEvent(event event) {
 
 func (t *PCTransport) processEvents() {
 	for event := range t.eventCh {
+		if t.isClosed.Load() {
+			// just drain the channel without processing events
+			continue
+		}
+
 		err := t.handleEvent(&event)
 		if err != nil {
 			t.params.Logger.Errorw("error handling event", err, "event", event.String())
@@ -1591,6 +1612,13 @@ func (t *PCTransport) setupSignalStateCheckTimer() {
 		failed := t.negotiationState != NegotiationStateNone
 
 		if t.negotiateCounter.Load() == negotiateVersion && failed {
+			t.params.Logger.Infow(
+				"negotiation timed out",
+				"localCurrent", t.pc.CurrentLocalDescription(),
+				"localPending", t.pc.PendingLocalDescription(),
+				"remoteCurrent", t.pc.CurrentRemoteDescription(),
+				"remotePending", t.pc.PendingRemoteDescription(),
+			)
 			if onNegotiationFailed := t.getOnNegotiationFailed(); onNegotiationFailed != nil {
 				onNegotiationFailed()
 			}
@@ -1846,7 +1874,13 @@ func (t *PCTransport) handleRemoteOfferReceived(sd *webrtc.SessionDescription) e
 
 func (t *PCTransport) handleRemoteAnswerReceived(sd *webrtc.SessionDescription) error {
 	if err := t.setRemoteDescription(*sd); err != nil {
-		return err
+		// Pion will call RTPSender.Send method for each new added Downtrack, and return error if the DownTrack.Bind
+		// returns error. In case of Downtrack.Bind returns ErrUnsupportedCodec, the signal state will be stable as negotiation is aleady compelted
+		// before startRTPSenders, and the peerconnection state can be recovered by next negotiation which will be triggered
+		// by the SubscriptionManager unsubscribe the failure DownTrack. So don't treat this error as negotiation failure.
+		if !errors.Is(err, webrtc.ErrUnsupportedCodec) {
+			return err
+		}
 	}
 
 	t.clearSignalStateCheckTimer()
@@ -1939,7 +1973,16 @@ func configureAudioTransceiver(tr *webrtc.RTPTransceiver, stereo bool, nack bool
 				c.SDPFmtpLine += ";sprop-stereo=1"
 			}
 			if nack {
-				c.RTCPFeedback = append(c.RTCPFeedback, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBNACK})
+				var nackFound bool
+				for _, fb := range c.RTCPFeedback {
+					if fb.Type == webrtc.TypeRTCPFBNACK {
+						nackFound = true
+						break
+					}
+				}
+				if !nackFound {
+					c.RTCPFeedback = append(c.RTCPFeedback, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBNACK})
+				}
 			}
 		}
 		configCodecs = append(configCodecs, c)

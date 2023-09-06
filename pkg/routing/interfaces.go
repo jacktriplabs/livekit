@@ -7,6 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -22,6 +23,7 @@ type MessageSink interface {
 	WriteMessage(msg proto.Message) error
 	IsClosed() bool
 	Close()
+	ConnectionID() livekit.ConnectionID
 }
 
 //counterfeiter:generate . MessageSource
@@ -30,19 +32,21 @@ type MessageSource interface {
 	ReadChan() <-chan proto.Message
 	IsClosed() bool
 	Close()
+	ConnectionID() livekit.ConnectionID
 }
 
 type ParticipantInit struct {
-	Identity        livekit.ParticipantIdentity
-	Name            livekit.ParticipantName
-	Reconnect       bool
-	ReconnectReason livekit.ReconnectReason
-	AutoSubscribe   bool
-	Client          *livekit.ClientInfo
-	Grants          *auth.ClaimGrants
-	Region          string
-	AdaptiveStream  bool
-	ID              livekit.ParticipantID
+	Identity             livekit.ParticipantIdentity
+	Name                 livekit.ParticipantName
+	Reconnect            bool
+	ReconnectReason      livekit.ReconnectReason
+	AutoSubscribe        bool
+	Client               *livekit.ClientInfo
+	Grants               *auth.ClaimGrants
+	Region               string
+	AdaptiveStream       bool
+	ID                   livekit.ParticipantID
+	SubscriberAllowPause *bool
 }
 
 type NewParticipantCallback func(
@@ -98,14 +102,16 @@ type MessageRouter interface {
 	WriteRoomRTC(ctx context.Context, roomName livekit.RoomName, msg *livekit.RTCNodeMessage) error
 }
 
-func CreateRouter(rc redis.UniversalClient, node LocalNode) Router {
+func CreateRouter(config *config.Config, rc redis.UniversalClient, node LocalNode, signalClient SignalClient) Router {
+	lr := NewLocalRouter(node, signalClient)
+
 	if rc != nil {
-		return NewRedisRouter(node, rc)
+		return NewRedisRouter(config, lr, rc)
 	}
 
 	// local routing and store
 	logger.Infow("using single-node routing")
-	return NewLocalRouter(node)
+	return lr
 }
 
 func (pi *ParticipantInit) ToStartSession(roomName livekit.RoomName, connectionID livekit.ConnectionID) (*livekit.StartSession, error) {
@@ -114,7 +120,7 @@ func (pi *ParticipantInit) ToStartSession(roomName livekit.RoomName, connectionI
 		return nil, err
 	}
 
-	return &livekit.StartSession{
+	ss := &livekit.StartSession{
 		RoomName: string(roomName),
 		Identity: string(pi.Identity),
 		Name:     string(pi.Name),
@@ -127,7 +133,13 @@ func (pi *ParticipantInit) ToStartSession(roomName livekit.RoomName, connectionI
 		GrantsJson:      string(claims),
 		AdaptiveStream:  pi.AdaptiveStream,
 		ParticipantId:   string(pi.ID),
-	}, nil
+	}
+	if pi.SubscriberAllowPause != nil {
+		subscriberAllowPause := *pi.SubscriberAllowPause
+		ss.SubscriberAllowPause = &subscriberAllowPause
+	}
+
+	return ss, nil
 }
 
 func ParticipantInitFromStartSession(ss *livekit.StartSession, region string) (*ParticipantInit, error) {
@@ -136,7 +148,7 @@ func ParticipantInitFromStartSession(ss *livekit.StartSession, region string) (*
 		return nil, err
 	}
 
-	return &ParticipantInit{
+	pi := &ParticipantInit{
 		Identity:        livekit.ParticipantIdentity(ss.Identity),
 		Name:            livekit.ParticipantName(ss.Name),
 		Reconnect:       ss.Reconnect,
@@ -147,5 +159,11 @@ func ParticipantInitFromStartSession(ss *livekit.StartSession, region string) (*
 		Region:          region,
 		AdaptiveStream:  ss.AdaptiveStream,
 		ID:              livekit.ParticipantID(ss.ParticipantId),
-	}, nil
+	}
+	if ss.SubscriberAllowPause != nil {
+		subscriberAllowPause := *ss.SubscriberAllowPause
+		pi.SubscriberAllowPause = &subscriberAllowPause
+	}
+
+	return pi, nil
 }

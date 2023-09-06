@@ -16,7 +16,7 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 	opusCodec := opusCodecCapability
 	opusCodec.RTCPFeedback = rtcpFeedback.Audio
 	var opusPayload webrtc.PayloadType
-	if isCodecEnabled(codecs, opusCodec) {
+	if IsCodecEnabled(codecs, opusCodec) {
 		opusPayload = 111
 		if err := me.RegisterCodec(webrtc.RTPCodecParameters{
 			RTPCodecCapability: opusCodec,
@@ -25,7 +25,7 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 			return err
 		}
 
-		if isCodecEnabled(codecs, redCodecCapability) {
+		if IsCodecEnabled(codecs, redCodecCapability) {
 			if err := me.RegisterCodec(webrtc.RTPCodecParameters{
 				RTPCodecCapability: redCodecCapability,
 				PayloadType:        63,
@@ -40,16 +40,14 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, RTCPFeedback: rtcpFeedback.Video},
 			PayloadType:        96,
 		},
-		/*
-			{
-				RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9, ClockRate: 90000, SDPFmtpLine: "profile-id=0", RTCPFeedback: rtcpFeedback.Video},
-				PayloadType:        98,
-			},
-			{
-				RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9, ClockRate: 90000, SDPFmtpLine: "profile-id=1", RTCPFeedback: rtcpFeedback.Video},
-				PayloadType:        100,
-			},
-		*/
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9, ClockRate: 90000, SDPFmtpLine: "profile-id=0", RTCPFeedback: rtcpFeedback.Video},
+			PayloadType:        98,
+		},
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9, ClockRate: 90000, SDPFmtpLine: "profile-id=1", RTCPFeedback: rtcpFeedback.Video},
+			PayloadType:        100,
+		},
 		{
 			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", RTCPFeedback: rtcpFeedback.Video},
 			PayloadType:        125,
@@ -67,7 +65,7 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 			PayloadType:        35,
 		},
 	} {
-		if isCodecEnabled(codecs, codec.RTPCodecCapability) {
+		if IsCodecEnabled(codecs, codec.RTPCodecCapability) {
 			if err := me.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
 				return err
 			}
@@ -105,7 +103,7 @@ func createMediaEngine(codecs []*livekit.Codec, config DirectionConfig) (*webrtc
 	return me, nil
 }
 
-func isCodecEnabled(codecs []*livekit.Codec, cap webrtc.RTPCodecCapability) bool {
+func IsCodecEnabled(codecs []*livekit.Codec, cap webrtc.RTPCodecCapability) bool {
 	for _, codec := range codecs {
 		if !strings.EqualFold(codec.Mime, cap.MimeType) {
 			continue

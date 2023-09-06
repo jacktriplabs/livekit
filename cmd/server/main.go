@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	serverlogger "github.com/livekit/livekit-server/pkg/logger"
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/logger"
@@ -103,8 +103,9 @@ func init() {
 
 func main() {
 	defer func() {
-		rtc.Recover(logger.GetLogger())
-		os.Exit(1)
+		if rtc.Recover(logger.GetLogger()) != nil {
+			os.Exit(1)
+		}
 	}()
 
 	generatedFlags, err := config.GenerateCLIFlags(baseFlags, true)
@@ -187,7 +188,7 @@ func getConfig(c *cli.Context) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	serverlogger.InitFromConfig(conf.Logging)
+	config.InitLoggerFromConfig(conf.Logging)
 
 	if c.String("config") == "" && c.String("config-body") == "" && conf.Development {
 		// use single port UDP when no config is provided
@@ -204,11 +205,26 @@ func getConfig(c *cli.Context) (*config.Config, error) {
 			conf.Keys = map[string]string{
 				"devkey": "secret",
 			}
+			shouldMatchRTCIP := false
 			// when dev mode and using shared keys, we'll bind to localhost by default
 			if conf.BindAddresses == nil {
 				conf.BindAddresses = []string{
 					"127.0.0.1",
-					"[::1]",
+					"::1",
+				}
+			} else {
+				// if non-loopback addresses are provided, then we'll match RTC IP to bind address
+				// our IP discovery ignores loopback addresses
+				for _, addr := range conf.BindAddresses {
+					ip := net.ParseIP(addr)
+					if ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+						shouldMatchRTCIP = true
+					}
+				}
+			}
+			if shouldMatchRTCIP {
+				for _, bindAddr := range conf.BindAddresses {
+					conf.RTC.IPs.Includes = append(conf.RTC.IPs.Includes, bindAddr+"/24")
 				}
 			}
 		}

@@ -1,6 +1,8 @@
 package dependencydescriptor
 
-import "errors"
+import (
+	"errors"
+)
 
 type DependencyDescriptorReader struct {
 	// Output.
@@ -59,7 +61,7 @@ func (r *DependencyDescriptorReader) Parse() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return r.buffer.ReadedBytes(), nil
+	return r.buffer.BytesRead(), nil
 }
 
 func (r *DependencyDescriptorReader) readMandatoryFields() error {
@@ -89,7 +91,6 @@ func (r *DependencyDescriptorReader) readMandatoryFields() error {
 }
 
 func (r *DependencyDescriptorReader) readExtendedFields() error {
-
 	templateDependencyStructurePresentFlag, err := r.buffer.ReadBool()
 	if err != nil {
 		return err
@@ -384,7 +385,6 @@ func (r *DependencyDescriptorReader) readFrameDtis() error {
 }
 
 func (r *DependencyDescriptorReader) readFrameFdiffs() error {
-
 	r.descriptor.FrameDependencies.FrameDiffs = r.descriptor.FrameDependencies.FrameDiffs[:0]
 	for {
 		nexFdiffSize, err := r.buffer.ReadBits(2)

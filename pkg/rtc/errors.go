@@ -14,10 +14,11 @@ var (
 	ErrMissingGrants           = errors.New("VideoGrant is missing")
 
 	// Track subscription related
-	ErrNoTrackPermission     = errors.New("participant is not allowed to subscribe to this track")
-	ErrNoSubscribePermission = errors.New("participant is not given permission to subscribe to tracks")
-	ErrTrackNotFound         = errors.New("track cannot be found")
-	ErrTrackNotAttached      = errors.New("track is not yet attached")
-	ErrTrackNotBound         = errors.New("track not bound")
-	ErrTrackNotNeeded        = errors.New("track not needed")
+	ErrNoTrackPermission         = errors.New("participant is not allowed to subscribe to this track")
+	ErrNoSubscribePermission     = errors.New("participant is not given permission to subscribe to tracks")
+	ErrTrackNotFound             = errors.New("track cannot be found")
+	ErrTrackNotAttached          = errors.New("track is not yet attached")
+	ErrTrackNotBound             = errors.New("track not bound")
+	ErrTrackNotNeeded            = errors.New("track not needed")
+	ErrSubscriptionLimitExceeded = errors.New("participant has exceeded its subscription limit")
 )

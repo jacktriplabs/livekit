@@ -112,8 +112,15 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 			continue
 		}
 
+		var info *livekit.TrackInfo
 		p.pendingTracksLock.RLock()
-		_, info := p.getPendingTrack(streamID, livekit.TrackType_VIDEO)
+		mt := p.getPublishedTrackBySdpCid(streamID)
+		if mt != nil {
+			info = mt.ToProto()
+		} else {
+			_, info = p.getPendingTrack(streamID, livekit.TrackType_VIDEO)
+		}
+
 		if info == nil {
 			p.pendingTracksLock.RUnlock()
 			continue
@@ -131,8 +138,8 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 		p.pendingTracksLock.RUnlock()
 
 		mime = strings.ToUpper(mime)
-		// remove dd extension if av1 not preferred
-		if !strings.Contains(mime, "AV1") {
+		// remove dd extension if av1/vp9 not preferred
+		if !strings.Contains(strings.ToLower(mime), "av1") && !strings.Contains(strings.ToLower(mime), "vp9") {
 			for i, attr := range unmatchVideo.Attributes {
 				if strings.Contains(attr.Value, dd.ExtensionUrl) {
 					unmatchVideo.Attributes[i] = unmatchVideo.Attributes[len(unmatchVideo.Attributes)-1]

@@ -17,6 +17,8 @@ import (
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
+	"github.com/livekit/livekit-server/pkg/sfu/pacer"
+	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -30,25 +32,26 @@ const (
 	udpLossFracUnstable = 25
 	// if in last 32 times RR, the unstable report count over this threshold, the connection is unstable
 	udpLossUnstableCountThreshold = 20
-	tcpGoodRTT                    = 80
 )
 
 type TransportManagerParams struct {
-	Identity                livekit.ParticipantIdentity
-	SID                     livekit.ParticipantID
-	SubscriberAsPrimary     bool
-	Config                  *WebRTCConfig
-	ProtocolVersion         types.ProtocolVersion
-	Telemetry               telemetry.TelemetryService
-	CongestionControlConfig config.CongestionControlConfig
-	EnabledCodecs           []*livekit.Codec
-	SimTracks               map[uint32]SimulcastTrackInfo
-	ClientConf              *livekit.ClientConfiguration
-	ClientInfo              ClientInfo
-	Migration               bool
-	AllowTCPFallback        bool
-	TURNSEnabled            bool
-	Logger                  logger.Logger
+	Identity                 livekit.ParticipantIdentity
+	SID                      livekit.ParticipantID
+	SubscriberAsPrimary      bool
+	Config                   *WebRTCConfig
+	ProtocolVersion          types.ProtocolVersion
+	Telemetry                telemetry.TelemetryService
+	CongestionControlConfig  config.CongestionControlConfig
+	EnabledCodecs            []*livekit.Codec
+	SimTracks                map[uint32]SimulcastTrackInfo
+	ClientConf               *livekit.ClientConfiguration
+	ClientInfo               ClientInfo
+	Migration                bool
+	AllowTCPFallback         bool
+	TCPFallbackRTTThreshold  int
+	AllowUDPUnstableFallback bool
+	TURNSEnabled             bool
+	Logger                   logger.Logger
 }
 
 type TransportManager struct {
@@ -62,6 +65,7 @@ type TransportManager struct {
 	isTransportReconfigured bool
 	lastFailure             time.Time
 	lastSignalAt            time.Time
+	signalSourceValid       atomic.Bool
 
 	pendingOfferPublisher        *webrtc.SessionDescription
 	pendingDataChannelsPublisher []*livekit.DataChannelInfo
@@ -92,18 +96,32 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 	}
 	t.mediaLossProxy.OnMediaLossUpdate(t.onMediaLossUpdate)
 
-	enabledCodecs := make([]*livekit.Codec, 0, len(params.EnabledCodecs))
-	for _, c := range params.EnabledCodecs {
-		var disabled bool
-		for _, disableCodec := range params.ClientConf.GetDisabledCodecs().GetCodecs() {
+	subscribeCodecs := make([]*livekit.Codec, 0, len(params.EnabledCodecs))
+	publishCodecs := make([]*livekit.Codec, 0, len(params.EnabledCodecs))
+	shouldDisable := func(c *livekit.Codec, disabledCodecs []*livekit.Codec) bool {
+		for _, disableCodec := range disabledCodecs {
 			// disable codec's fmtp is empty means disable this codec entirely
 			if strings.EqualFold(c.Mime, disableCodec.Mime) && (disableCodec.FmtpLine == "" || disableCodec.FmtpLine == c.FmtpLine) {
-				disabled = true
-				break
+				return true
 			}
 		}
-		if !disabled {
-			enabledCodecs = append(enabledCodecs, c)
+		return false
+	}
+	for _, c := range params.EnabledCodecs {
+		var publishDisabled bool
+		var subscribeDisabled bool
+		if shouldDisable(c, params.ClientConf.GetDisabledCodecs().GetCodecs()) {
+			publishDisabled = true
+			subscribeDisabled = true
+		}
+		if shouldDisable(c, params.ClientConf.GetDisabledCodecs().GetPublish()) {
+			publishDisabled = true
+		}
+		if !publishDisabled {
+			publishCodecs = append(publishCodecs, c)
+		}
+		if !subscribeDisabled {
+			subscribeCodecs = append(subscribeCodecs, c)
 		}
 	}
 
@@ -115,7 +133,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		DirectionConfig:         params.Config.Publisher,
 		CongestionControlConfig: params.CongestionControlConfig,
 		Telemetry:               params.Telemetry,
-		EnabledCodecs:           enabledCodecs,
+		EnabledCodecs:           publishCodecs,
 		Logger:                  LoggerWithPCTarget(params.Logger, livekit.SignalTarget_PUBLISHER),
 		SimTracks:               params.SimTracks,
 		ClientInfo:              params.ClientInfo,
@@ -147,7 +165,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		DirectionConfig:         params.Config.Subscriber,
 		CongestionControlConfig: params.CongestionControlConfig,
 		Telemetry:               params.Telemetry,
-		EnabledCodecs:           enabledCodecs,
+		EnabledCodecs:           subscribeCodecs,
 		Logger:                  LoggerWithPCTarget(params.Logger, livekit.SignalTarget_SUBSCRIBER),
 		ClientInfo:              params.ClientInfo,
 		IsOfferer:               true,
@@ -177,16 +195,14 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		}
 	}
 
+	t.signalSourceValid.Store(true)
+
 	return t, nil
 }
 
 func (t *TransportManager) Close() {
 	t.publisher.Close()
 	t.subscriber.Close()
-}
-
-func (t *TransportManager) HaveAllTransportEverConnected() bool {
-	return t.publisher.HasEverConnected() && t.subscriber.HasEverConnected()
 }
 
 func (t *TransportManager) SubscriberClose() {
@@ -210,6 +226,10 @@ func (t *TransportManager) OnPublisherInitialConnected(f func()) {
 
 func (t *TransportManager) OnPublisherTrack(f func(track *webrtc.TrackRemote, rtpReceiver *webrtc.RTPReceiver)) {
 	t.publisher.OnTrack(f)
+}
+
+func (t *TransportManager) HasPublisherEverConnected() bool {
+	return t.publisher.HasEverConnected()
 }
 
 func (t *TransportManager) IsPublisherEstablished() bool {
@@ -240,7 +260,7 @@ func (t *TransportManager) OnSubscriberInitialConnected(f func()) {
 	t.onSubscriberInitialConnected = f
 }
 
-func (t *TransportManager) OnSubscriberStreamStateChange(f func(update *sfu.StreamStateUpdate) error) {
+func (t *TransportManager) OnSubscriberStreamStateChange(f func(update *streamallocator.StreamStateUpdate) error) {
 	t.subscriber.OnStreamStateChange(f)
 }
 
@@ -262,6 +282,10 @@ func (t *TransportManager) RemoveTrackFromSubscriber(sender *webrtc.RTPSender) e
 
 func (t *TransportManager) WriteSubscriberRTCP(pkts []rtcp.Packet) error {
 	return t.subscriber.WriteRTCP(pkts)
+}
+
+func (t *TransportManager) GetSubscriberPacer() pacer.Pacer {
+	return t.subscriber.GetPacer()
 }
 
 func (t *TransportManager) OnPrimaryTransportInitialConnected(f func()) {
@@ -360,7 +384,7 @@ func (t *TransportManager) GetUnmatchMediaForOffer(offer webrtc.SessionDescripti
 		answer := lastAnswer.(webrtc.SessionDescription)
 		parsedAnswer, err1 := answer.Unmarshal()
 		if err1 != nil {
-			// should not happend
+			// should not happen
 			t.params.Logger.Errorw("failed to parse last answer", err)
 			return
 		}
@@ -453,15 +477,41 @@ func (t *TransportManager) NegotiateSubscriber(force bool) {
 	t.subscriber.Negotiate(force)
 }
 
-func (t *TransportManager) ICERestart(iceConfig *livekit.ICEConfig, resetShortConnection bool) {
-	if iceConfig != nil {
-		t.SetICEConfig(iceConfig)
+func (t *TransportManager) HandleClientReconnect(reason livekit.ReconnectReason) {
+	var (
+		isShort              bool
+		duration             time.Duration
+		resetShortConnection bool
+	)
+	switch reason {
+	case livekit.ReconnectReason_RR_PUBLISHER_FAILED:
+		resetShortConnection = true
+		isShort, duration = t.publisher.IsShortConnection(time.Now())
+
+	case livekit.ReconnectReason_RR_SUBSCRIBER_FAILED:
+		resetShortConnection = true
+		isShort, duration = t.subscriber.IsShortConnection(time.Now())
+	}
+
+	if isShort {
+		t.lock.Lock()
+		t.resetTransportConfigureLocked(false)
+		t.lock.Unlock()
+		t.params.Logger.Infow("short connection by client ice restart", "duration", duration, "reason", reason)
+		t.handleConnectionFailed(isShort)
 	}
 
 	if resetShortConnection {
 		t.publisher.ResetShortConnOnICERestart()
 		t.subscriber.ResetShortConnOnICERestart()
 	}
+}
+
+func (t *TransportManager) ICERestart(iceConfig *livekit.ICEConfig) {
+	if iceConfig != nil {
+		t.SetICEConfig(iceConfig)
+	}
+
 	t.subscriber.ICERestart()
 }
 
@@ -475,14 +525,18 @@ func (t *TransportManager) SetICEConfig(iceConfig *livekit.ICEConfig) {
 	t.configureICE(iceConfig, true)
 }
 
+func (t *TransportManager) resetTransportConfigureLocked(reconfigured bool) {
+	t.failureCount = 0
+	t.isTransportReconfigured = reconfigured
+	t.udpLossUnstableCount = 0
+	t.lastFailure = time.Time{}
+}
+
 func (t *TransportManager) configureICE(iceConfig *livekit.ICEConfig, reset bool) {
 	t.lock.Lock()
 	isEqual := proto.Equal(t.iceConfig, iceConfig)
 	if reset || !isEqual {
-		t.failureCount = 0
-		t.isTransportReconfigured = !reset
-		t.udpLossUnstableCount = 0
-		t.lastFailure = time.Time{}
+		t.resetTransportConfigureLocked(!reset)
 	}
 
 	if isEqual {
@@ -536,11 +590,12 @@ func (t *TransportManager) handleConnectionFailed(isShortLived bool) {
 	}
 
 	lastSignalSince := time.Since(t.lastSignalAt)
-	if lastSignalSince > iceFailedTimeout {
-		// the failed might cause by network interrupt because we have not seen any signal in the time window too
+	signalValid := t.signalSourceValid.Load()
+	if lastSignalSince > iceFailedTimeout || !signalValid {
+		// the failed might cause by network interrupt because signal closed or we have not seen any signal in the time window,
 		// so don't switch to next candidate type
-		t.params.Logger.Infow("ignoring prefer candidate check by ICE failure because no signal received in the ice failed window",
-			"lastSignalSince", lastSignalSince)
+		t.params.Logger.Infow("ignoring prefer candidate check by ICE failure because signal connection interrupted",
+			"lastSignalSince", lastSignalSince, "signalValid", signalValid)
 		t.failureCount = 0
 		t.lastFailure = time.Time{}
 		t.lock.Unlock()
@@ -548,13 +603,13 @@ func (t *TransportManager) handleConnectionFailed(isShortLived bool) {
 	}
 
 	//
-	// Checking only `PreferenceSubcriber` field although any connection failure (PUBLISHER OR SUBSCRIBER) will
+	// Checking only `PreferenceSubscriber` field although any connection failure (PUBLISHER OR SUBSCRIBER) will
 	// flow through here.
 	//
 	// As both transports are switched to the same type on any failure, checking just subscriber should be fine.
 	//
 	getNext := func(ic *livekit.ICEConfig) livekit.ICECandidateType {
-		if ic.PreferenceSubscriber == livekit.ICECandidateType_ICT_NONE && t.params.ClientInfo.SupportsICETCP() {
+		if ic.PreferenceSubscriber == livekit.ICECandidateType_ICT_NONE && t.params.ClientInfo.SupportsICETCP() && t.canUseICETCP() {
 			return livekit.ICECandidateType_ICT_TCP
 		} else if ic.PreferenceSubscriber != livekit.ICECandidateType_ICT_TLS && t.params.TURNSEnabled {
 			return livekit.ICECandidateType_ICT_TLS
@@ -675,12 +730,15 @@ func (t *TransportManager) OnReceiverReport(dt *sfu.DownTrack, report *rtcp.Rece
 }
 
 func (t *TransportManager) onMediaLossUpdate(loss uint8) {
+	if t.params.TCPFallbackRTTThreshold == 0 || !t.params.AllowUDPUnstableFallback {
+		return
+	}
 	t.lock.Lock()
 	t.udpLossUnstableCount <<= 1
 	if loss >= uint8(255*udpLossFracUnstable/100) {
 		t.udpLossUnstableCount |= 1
 		if bits.OnesCount32(t.udpLossUnstableCount) >= udpLossUnstableCountThreshold {
-			if t.udpRTT > 0 && t.signalingRTT < uint32(float32(t.udpRTT)*1.3) && t.signalingRTT < tcpGoodRTT && time.Since(t.lastSignalAt) < iceFailedTimeout {
+			if t.udpRTT > 0 && t.signalingRTT < uint32(float32(t.udpRTT)*1.3) && int(t.signalingRTT) < t.params.TCPFallbackRTTThreshold && time.Since(t.lastSignalAt) < iceFailedTimeout {
 				t.udpLossUnstableCount = 0
 				t.lock.Unlock()
 
@@ -697,7 +755,9 @@ func (t *TransportManager) onMediaLossUpdate(loss uint8) {
 }
 
 func (t *TransportManager) UpdateSignalingRTT(rtt uint32) {
+	t.lock.Lock()
 	t.signalingRTT = rtt
+	t.lock.Unlock()
 	t.publisher.SetSignalingRTT(rtt)
 	t.subscriber.SetSignalingRTT(rtt)
 
@@ -707,11 +767,13 @@ func (t *TransportManager) UpdateSignalingRTT(rtt uint32) {
 }
 
 func (t *TransportManager) UpdateMediaRTT(rtt uint32) {
+	t.lock.Lock()
 	if t.udpRTT == 0 {
 		t.udpRTT = rtt
 	} else {
 		t.udpRTT = uint32(int(t.udpRTT) + (int(rtt)-int(t.udpRTT))/2)
 	}
+	t.lock.Unlock()
 }
 
 func (t *TransportManager) UpdateLastSeenSignal() {
@@ -724,4 +786,27 @@ func (t *TransportManager) SinceLastSignal() time.Duration {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	return time.Since(t.lastSignalAt)
+}
+
+func (t *TransportManager) LastSeenSignalAt() time.Time {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.lastSignalAt
+}
+
+func (t *TransportManager) canUseICETCP() bool {
+	return t.params.TCPFallbackRTTThreshold == 0 || int(t.signalingRTT) < t.params.TCPFallbackRTTThreshold
+}
+
+func (t *TransportManager) SetSignalSourceValid(valid bool) {
+	t.signalSourceValid.Store(valid)
+	t.params.Logger.Debugw("signal source valid", "valid", valid)
+}
+
+func (t *TransportManager) SetSubscriberAllowPause(allowPause bool) {
+	t.subscriber.SetAllowPauseOfStreamAllocator(allowPause)
+}
+
+func (t *TransportManager) SetSubscriberChannelCapacity(channelCapacity int64) {
+	t.subscriber.SetChannelCapacityOfStreamAllocator(channelCapacity)
 }

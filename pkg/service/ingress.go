@@ -5,6 +5,7 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/protocol/ingress"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
@@ -55,7 +56,17 @@ func (s *IngressService) CreateIngress(ctx context.Context, req *livekit.CreateI
 		AppendLogFields(ctx, fields...)
 	}()
 
-	ig, err := s.CreateIngressWithUrlPrefix(ctx, s.conf.RTMPBaseURL, req)
+	var urlPrefix string
+	switch req.InputType {
+	case livekit.IngressInput_RTMP_INPUT:
+		urlPrefix = s.conf.RTMPBaseURL
+	case livekit.IngressInput_WHIP_INPUT:
+		urlPrefix = s.conf.WHIPBaseURL
+	default:
+		return nil, ingress.ErrInvalidIngressType
+	}
+
+	ig, err := s.CreateIngressWithUrlPrefix(ctx, urlPrefix, req)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +94,7 @@ func (s *IngressService) CreateIngressWithUrlPrefix(ctx context.Context, urlPref
 		InputType:           req.InputType,
 		Audio:               req.Audio,
 		Video:               req.Video,
+		BypassTranscoding:   req.BypassTranscoding,
 		RoomName:            req.RoomName,
 		ParticipantIdentity: req.ParticipantIdentity,
 		ParticipantName:     req.ParticipantName,
@@ -90,12 +102,47 @@ func (s *IngressService) CreateIngressWithUrlPrefix(ctx context.Context, urlPref
 		State:               &livekit.IngressState{},
 	}
 
+	if err := ingress.ValidateForSerialization(info); err != nil {
+		return nil, err
+	}
+
 	if err = s.store.StoreIngress(ctx, info); err != nil {
 		logger.Errorw("could not write ingress info", err)
 		return nil, err
 	}
+	s.telemetry.IngressCreated(ctx, info)
 
 	return info, nil
+}
+
+func updateInfoUsingRequest(req *livekit.UpdateIngressRequest, info *livekit.IngressInfo) error {
+	if req.Name != "" {
+		info.Name = req.Name
+	}
+	if req.RoomName != "" {
+		info.RoomName = req.RoomName
+	}
+	if req.ParticipantIdentity != "" {
+		info.ParticipantIdentity = req.ParticipantIdentity
+	}
+	if req.ParticipantName != "" {
+		info.ParticipantName = req.ParticipantName
+	}
+	if req.BypassTranscoding != nil {
+		info.BypassTranscoding = *req.BypassTranscoding
+	}
+	if req.Audio != nil {
+		info.Audio = req.Audio
+	}
+	if req.Video != nil {
+		info.Video = req.Video
+	}
+
+	if err := ingress.ValidateForSerialization(info); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s *IngressService) UpdateIngress(ctx context.Context, req *livekit.UpdateIngressRequest) (*livekit.IngressInfo, error) {
@@ -132,28 +179,19 @@ func (s *IngressService) UpdateIngress(ctx context.Context, req *livekit.UpdateI
 		fallthrough
 
 	case livekit.IngressState_ENDPOINT_INACTIVE:
-		if req.Name != "" {
-			info.Name = req.Name
-		}
-		if req.RoomName != "" {
-			info.RoomName = req.RoomName
-		}
-		if req.ParticipantIdentity != "" {
-			info.ParticipantIdentity = req.ParticipantIdentity
-		}
-		if req.ParticipantName != "" {
-			info.ParticipantName = req.ParticipantName
-		}
-		if req.Audio != nil {
-			info.Audio = req.Audio
-		}
-		if req.Video != nil {
-			info.Video = req.Video
+		err = updateInfoUsingRequest(req, info)
+		if err != nil {
+			return nil, err
 		}
 
 	case livekit.IngressState_ENDPOINT_BUFFERING,
 		livekit.IngressState_ENDPOINT_PUBLISHING:
-		// Do not update store the returned state as the ingress service will do it
+		err := updateInfoUsingRequest(req, info)
+		if err != nil {
+			return nil, err
+		}
+
+		// Do not store the returned state as the ingress service will do it
 		if _, err = s.psrpcClient.UpdateIngress(ctx, req.IngressId, req); err != nil {
 			logger.Warnw("could not update active ingress", err)
 		}
@@ -217,5 +255,8 @@ func (s *IngressService) DeleteIngress(ctx context.Context, req *livekit.DeleteI
 	}
 
 	info.State.Status = livekit.IngressState_ENDPOINT_INACTIVE
+
+	s.telemetry.IngressDeleted(ctx, info)
+
 	return info, nil
 }
