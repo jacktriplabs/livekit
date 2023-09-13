@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -8,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
 
+	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
@@ -40,7 +55,7 @@ type SubscribedTrack struct {
 	needsNegotiation atomic.Bool
 
 	bindLock        sync.Mutex
-	onBindCallbacks []func()
+	onBindCallbacks []func(error)
 	onClose         atomic.Value // func(bool)
 	bound           atomic.Bool
 
@@ -50,7 +65,7 @@ type SubscribedTrack struct {
 func NewSubscribedTrack(params SubscribedTrackParams) *SubscribedTrack {
 	s := &SubscribedTrack{
 		params: params,
-		logger: params.Subscriber.GetLogger().WithValues(
+		logger: params.Subscriber.GetLogger().WithComponent(sutils.ComponentSub).WithValues(
 			"trackID", params.DownTrack.ID(),
 			"publisherID", params.PublisherID,
 			"publisher", params.PublisherIdentity,
@@ -61,7 +76,7 @@ func NewSubscribedTrack(params SubscribedTrackParams) *SubscribedTrack {
 	return s
 }
 
-func (t *SubscribedTrack) AddOnBind(f func()) {
+func (t *SubscribedTrack) AddOnBind(f func(error)) {
 	t.bindLock.Lock()
 	bound := t.bound.Load()
 	if !bound {
@@ -71,19 +86,21 @@ func (t *SubscribedTrack) AddOnBind(f func()) {
 
 	if bound {
 		// fire immediately, do not need to persist since bind is a one time event
-		go f()
+		go f(nil)
 	}
 }
 
 // for DownTrack callback to notify us that it's bound
-func (t *SubscribedTrack) Bound() {
+func (t *SubscribedTrack) Bound(err error) {
 	t.bindLock.Lock()
-	t.bound.Store(true)
+	if err == nil {
+		t.bound.Store(true)
+	}
 	callbacks := t.onBindCallbacks
 	t.onBindCallbacks = nil
 	t.bindLock.Unlock()
 
-	if t.MediaTrack().Kind() == livekit.TrackType_VIDEO {
+	if err == nil && t.MediaTrack().Kind() == livekit.TrackType_VIDEO {
 		// When AdaptiveStream is enabled, default the subscriber to LOW quality stream
 		// we would want LOW instead of OFF for a couple of reasons
 		// 1. when a subscriber unsubscribes from a track, we would forget their previously defined settings
@@ -107,7 +124,7 @@ func (t *SubscribedTrack) Bound() {
 	}
 
 	for _, cb := range callbacks {
-		go cb()
+		go cb(err)
 	}
 }
 
@@ -177,7 +194,7 @@ func (t *SubscribedTrack) UpdateSubscriberSettings(settings *livekit.UpdateTrack
 	t.settings.Store(settings)
 
 	if prevDisabled != settings.Disabled {
-		t.logger.Infow("updated subscribed track enabled", "enabled", !settings.Disabled)
+		t.logger.Debugw("updated subscribed track enabled", "enabled", !settings.Disabled)
 	}
 
 	// avoid frequent changes to mute & video layers, unless it became visible
@@ -195,14 +212,11 @@ func (t *SubscribedTrack) UpdateVideoLayer() {
 	}
 
 	settings := t.settings.Load()
-	if settings == nil {
+	if settings == nil || settings.Disabled {
 		return
 	}
 
-	t.logger.Debugw("updating video layer",
-		"settings", settings,
-	)
-
+	t.logger.Debugw("updating video layer", "settings", settings)
 	spatial := t.spatialLayerFromSettings(settings)
 	t.DownTrack().SetMaxSpatialLayer(spatial)
 	if settings.Fps > 0 {

@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -18,6 +32,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
+	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
@@ -70,6 +85,7 @@ func NewMediaTrack(params MediaTrackParams) *MediaTrack {
 		ParticipantVersion:  params.ParticipantVersion,
 		ReceiverConfig:      params.ReceiverConfig,
 		SubscriberConfig:    params.SubscriberConfig,
+		AudioConfig:         params.AudioConfig,
 		Telemetry:           params.Telemetry,
 		Logger:              params.Logger,
 	})
@@ -188,6 +204,7 @@ func (t *MediaTrack) SetPendingCodecSid(codecs []*livekit.SimulcastCodec) {
 		}
 	}
 	t.params.TrackInfo = ti
+	t.MediaTrackReceiver.UpdateTrackInfo(ti)
 }
 
 // AddReceiver adds a new RTP receiver to the track, returns true when receiver represents a new codec
@@ -218,6 +235,7 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 
 	t.lock.Lock()
 	mime := strings.ToLower(track.Codec().MimeType)
+	layer := buffer.RidToSpatialLayer(track.RID(), t.trackInfo)
 	t.params.Logger.Debugw("AddReceiver", "mime", track.Codec().MimeType)
 	wr := t.MediaTrackReceiver.Receiver(mime)
 	if wr == nil {
@@ -308,15 +326,27 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 	buff.OnFpsChanged(func() {
 		t.MediaTrackSubscriptions.UpdateVideoLayers()
 	})
+
+	buff.OnFinalRtpStats(func(stats *buffer.RTPStats) {
+		t.params.Telemetry.TrackPublishRTPStats(
+			context.Background(),
+			t.params.ParticipantID,
+			t.ID(),
+			mime,
+			int(layer),
+			stats.ToProto(),
+		)
+	})
 	return newCodec
 }
 
-func (t *MediaTrack) GetConnectionScore() float32 {
+func (t *MediaTrack) GetConnectionScoreAndQuality() (float32, livekit.ConnectionQuality) {
 	receiver := t.PrimaryReceiver()
 	if rtcReceiver, ok := receiver.(*sfu.WebRTCReceiver); ok {
-		return rtcReceiver.GetConnectionScore()
+		return rtcReceiver.GetConnectionScoreAndQuality()
 	}
-	return 0.0
+
+	return connectionquality.MaxMOS, livekit.ConnectionQuality_EXCELLENT
 }
 
 func (t *MediaTrack) SetRTT(rtt uint32) {
@@ -354,7 +384,6 @@ func (t *MediaTrack) Close(willBeResumed bool) {
 	if t.dynacastManager != nil {
 		t.dynacastManager.Close()
 	}
-
 	t.MediaTrackReceiver.ClearAllReceivers(willBeResumed)
 	t.MediaTrackReceiver.Close()
 }

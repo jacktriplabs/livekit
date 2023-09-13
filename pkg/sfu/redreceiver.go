@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package sfu
 
 import (
@@ -95,20 +109,19 @@ func (r *RedReceiver) IsClosed() bool {
 
 func (r *RedReceiver) Close() {
 	r.closed.Store(true)
-	for _, dt := range r.downTrackSpreader.ResetAndGetDownTracks() {
-		dt.Close()
-	}
+	closeTrackSenders(r.downTrackSpreader.ResetAndGetDownTracks())
 }
 
 func (r *RedReceiver) ReadRTP(buf []byte, layer uint8, sn uint16) (int, error) {
 	// red encoding don't support nack
-	return 0, bucket.ErrPacketNotFound
+	return 0, bucket.ErrPacketMismatch
 }
 
 func (r *RedReceiver) encodeRedForPrimary(pkt *rtp.Packet, redPayload []byte) (int, error) {
-	redPkts := make([]*rtp.Packet, 0, maxRedCount+1)
+	redLength := len(r.pktBuff)
+	redPkts := make([]*rtp.Packet, 0, redLength+1)
 	lastNilPkt := -1
-	for i := len(r.pktBuff) - 1; i >= 0; i-- {
+	for i := redLength - 1; i >= 0; i-- {
 		if r.pktBuff[i] == nil {
 			lastNilPkt = i
 			break
@@ -118,17 +131,26 @@ func (r *RedReceiver) encodeRedForPrimary(pkt *rtp.Packet, redPayload []byte) (i
 
 	for _, prev := range r.pktBuff[lastNilPkt+1:] {
 		if pkt.SequenceNumber == prev.SequenceNumber ||
-			(pkt.SequenceNumber-prev.SequenceNumber) > uint16(maxRedCount) {
+			(pkt.SequenceNumber-prev.SequenceNumber) > uint16(redLength) ||
+			(pkt.Timestamp-prev.Timestamp) >= (1<<14) {
 			continue
 		}
 		redPkts = append(redPkts, prev)
 	}
 
-	if r.pktBuff[1] == nil || pkt.SequenceNumber-r.pktBuff[1].SequenceNumber < 0x8000 {
-		/* update packet, not copy the rtp packet here since we only hold two packets for red encoding,
-		the upstream buffer size is much larger than two, so it is safe to use packet directly
-		*/
-		r.pktBuff[0], r.pktBuff[1] = r.pktBuff[1], pkt
+	// insert primary packet in history buffer
+	// NOTE: packet is copied from retransmission buffer and used in forwarding path. So, not making another
+	// copy here and just maintaining pointer to the packet as the forwarding path should not alter the packet.
+	for i := redLength - 1; i >= 0; i-- {
+		if r.pktBuff[i] == nil || // history is empty
+			pkt.SequenceNumber-r.pktBuff[i].SequenceNumber < (1<<15) { // received packet has more recent sequence number
+			// age out older ones
+			for j := 0; j < i; j++ {
+				r.pktBuff[j] = r.pktBuff[j+1]
+			}
+			r.pktBuff[i] = pkt
+			break
+		}
 	}
 
 	return encodeRedForPrimary(redPkts, pkt, redPayload)
