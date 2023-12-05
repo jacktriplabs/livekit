@@ -1,7 +1,33 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package dependencydescriptor
 
 import (
 	"errors"
+)
+
+var (
+	ErrDDReaderNoStructure              = errors.New("DependencyDescriptorReader: Structure is nil")
+	ErrDDReaderTemplateWithoutStructure = errors.New("DependencyDescriptorReader: has templateDependencyStructurePresentFlag but AttachedStructure is nil")
+	ErrDDReaderTooManyTemplates         = errors.New("DependencyDescriptorReader: too many templates")
+	ErrDDReaderTooManyTemporalLayers    = errors.New("DependencyDescriptorReader: too many temporal layers")
+	ErrDDReaderTooManySpatialLayers     = errors.New("DependencyDescriptorReader: too many spatial layers")
+	ErrDDReaderInvalidTemplateIndex     = errors.New("DependencyDescriptorReader: invalid template index")
+	ErrDDReaderInvalidSpatialLayer      = errors.New("DependencyDescriptorReader: invalid spatial layer, should be less than the number of resolutions")
+	ErrDDReaderNumDTIMismatch           = errors.New("DependencyDescriptorReader: decode target indications length mismatch with structure num decode targets")
+	ErrDDReaderNumChainDiffsMismatch    = errors.New("DependencyDescriptorReader: chain diffs length mismatch with structure num chains")
 )
 
 type DependencyDescriptorReader struct {
@@ -45,7 +71,7 @@ func (r *DependencyDescriptorReader) Parse() (int, error) {
 
 	if r.structure == nil {
 		r.buffer.Invalidate()
-		return 0, errors.New("DependencyDescriptorReader: Structure is nil")
+		return 0, ErrDDReaderNoStructure
 	}
 
 	if r.activeDecodeTargetsPresentFlag {
@@ -126,7 +152,7 @@ func (r *DependencyDescriptorReader) readExtendedFields() error {
 			return err
 		}
 		if r.descriptor.AttachedStructure == nil {
-			return errors.New("DependencyDescriptorReader: has templateDependencyStructurePresentFlag but AttachedStructure is nil")
+			return ErrDDReaderTemplateWithoutStructure
 		}
 		bitmask := uint32((uint64(1) << r.descriptor.AttachedStructure.NumDecodeTargets) - 1)
 		r.descriptor.ActiveDecodeTargetsBitmask = &bitmask
@@ -189,7 +215,7 @@ func (r *DependencyDescriptorReader) readTemplateLayers() error {
 	)
 	for {
 		if len(templates) == MaxTemplates {
-			return errors.New("DependencyDescriptorReader: too many templates")
+			return ErrDDReaderTooManyTemplates
 		}
 
 		var lastTemplate FrameDependencyTemplate
@@ -206,13 +232,13 @@ func (r *DependencyDescriptorReader) readTemplateLayers() error {
 		if nextLayerIdc == nextTemporalLayer {
 			temporalId++
 			if temporalId >= MaxTemporalIds {
-				return errors.New("DependencyDescriptorReader: too many temporal layers")
+				return ErrDDReaderTooManyTemporalLayers
 			}
 		} else if nextLayerIdc == nextSpatialLayer {
 			spatialId++
 			temporalId = 0
 			if spatialId >= MaxSpatialIds {
-				return errors.New("DependencyDescriptorReader: too many spatial layers")
+				return ErrDDReaderTooManySpatialLayers
 			}
 		}
 
@@ -326,7 +352,7 @@ func (r *DependencyDescriptorReader) readFrameDependencyDefinition() error {
 
 	if templateIndex >= len(r.structure.Templates) {
 		r.buffer.Invalidate()
-		return errors.New("DependencyDescriptorReader: invalid template index")
+		return ErrDDReaderInvalidTemplateIndex
 	}
 
 	// Copy all the fields from the matching template
@@ -360,7 +386,7 @@ func (r *DependencyDescriptorReader) readFrameDependencyDefinition() error {
 		// then each spatial layer got one.
 		if r.descriptor.FrameDependencies.SpatialId >= len(r.structure.Resolutions) {
 			r.buffer.Invalidate()
-			return errors.New("DependencyDescriptorReader: invalid spatial layer, should be less than the number of resolutions")
+			return ErrDDReaderInvalidSpatialLayer
 		}
 		res := r.structure.Resolutions[r.descriptor.FrameDependencies.SpatialId]
 		r.descriptor.Resolution = &res
@@ -371,7 +397,7 @@ func (r *DependencyDescriptorReader) readFrameDependencyDefinition() error {
 
 func (r *DependencyDescriptorReader) readFrameDtis() error {
 	if len(r.descriptor.FrameDependencies.DecodeTargetIndications) != r.structure.NumDecodeTargets {
-		return errors.New("DependencyDescriptorReader: decode target indications length mismatch with structure num decode targets")
+		return ErrDDReaderNumDTIMismatch
 	}
 
 	for i := range r.descriptor.FrameDependencies.DecodeTargetIndications {
@@ -406,7 +432,7 @@ func (r *DependencyDescriptorReader) readFrameFdiffs() error {
 
 func (r *DependencyDescriptorReader) readFrameChains() error {
 	if len(r.descriptor.FrameDependencies.ChainDiffs) != r.structure.NumChains {
-		return errors.New("DependencyDescriptorReader: chain diffs length mismatch with structure num chains")
+		return ErrDDReaderNumChainDiffsMismatch
 	}
 
 	for i := range r.descriptor.FrameDependencies.ChainDiffs {

@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package service
 
 import (
@@ -17,16 +31,17 @@ import (
 	"github.com/ua-parser/uap-go/uaparser"
 	"golang.org/x/exp/maps"
 
-	"github.com/livekit/livekit-server/pkg/utils"
-	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
-
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/routing/selector"
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
+	"github.com/livekit/livekit-server/pkg/utils"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	putil "github.com/livekit/protocol/utils"
+	"github.com/livekit/psrpc"
 )
 
 type RTCService struct {
@@ -39,6 +54,7 @@ type RTCService struct {
 	isDev         bool
 	limits        config.LimitConfig
 	parser        *uaparser.Parser
+	agentClient   rtc.AgentClient
 	telemetry     telemetry.TelemetryService
 
 	mu          sync.Mutex
@@ -51,6 +67,7 @@ func NewRTCService(
 	store ServiceStore,
 	router routing.MessageRouter,
 	currentNode routing.LocalNode,
+	agentClient rtc.AgentClient,
 	telemetry telemetry.TelemetryService,
 ) *RTCService {
 	s := &RTCService{
@@ -63,6 +80,7 @@ func NewRTCService(
 		isDev:         conf.Development,
 		limits:        conf.Limit,
 		parser:        uaparser.NewFromSaved(),
+		agentClient:   agentClient,
 		telemetry:     telemetry,
 		connections:   map[*websocket.Conn]struct{}{},
 	}
@@ -214,6 +232,7 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			logger.Warnw("failed to start connection, retrying", err, fieldsWithAttempt...)
 		}
 	}
+
 	if err != nil {
 		prometheus.IncrementParticipantJoinFail(1)
 		handleError(w, http.StatusInternalServerError, err, loggerFields...)
@@ -242,7 +261,7 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	done := make(chan struct{})
-	// function exits when websocket terminates, it'll close the event reading off of response sink as well
+	// function exits when websocket terminates, it'll close the event reading off of request sink and response source as well
 	defer func() {
 		pLogger.Infow("finishing WS connection", "connID", cr.ConnectionID)
 		cr.ResponseSource.Close()
@@ -273,13 +292,13 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// websocket established
 	sigConn := NewWSSignalConnection(conn)
-	if count, err := sigConn.WriteResponse(initialResponse); err != nil {
+	count, err := sigConn.WriteResponse(initialResponse)
+	if err != nil {
 		pLogger.Warnw("could not write initial response", err)
 		return
-	} else {
-		if signalStats != nil {
-			signalStats.AddBytes(uint64(count), true)
-		}
+	}
+	if signalStats != nil {
+		signalStats.AddBytes(uint64(count), true)
 	}
 	pLogger.Infow("new client WS connected",
 		"connID", cr.ConnectionID,
@@ -306,7 +325,7 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			case msg := <-cr.ResponseSource.ReadChan():
 				if msg == nil {
-					pLogger.Infow("nothing to read from response source", "connID", cr.ConnectionID)
+					pLogger.Debugw("nothing to read from response source", "connID", cr.ConnectionID)
 					return
 				}
 				res, ok := msg.(*livekit.SignalResponse)
@@ -347,8 +366,16 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req, count, err := sigConn.ReadRequest()
 		if err != nil {
 			// normal/expected closure
-			if err == io.EOF || strings.HasSuffix(err.Error(), "use of closed network connection") ||
-				websocket.IsCloseError(err, websocket.CloseAbnormalClosure, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
+			if err == io.EOF ||
+				strings.HasSuffix(err.Error(), "use of closed network connection") ||
+				strings.HasSuffix(err.Error(), "connection reset by peer") ||
+				websocket.IsCloseError(
+					err,
+					websocket.CloseAbnormalClosure,
+					websocket.CloseGoingAway,
+					websocket.CloseNormalClosure,
+					websocket.CloseNoStatusReceived,
+				) {
 				pLogger.Infow("exit ws read loop for closed connection", "connID", cr.ConnectionID, "wsError", err)
 			} else {
 				pLogger.Errorw("error reading from websocket", err, "connID", cr.ConnectionID)
@@ -396,6 +423,10 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if err := cr.RequestSink.WriteMessage(req); err != nil {
 			pLogger.Warnw("error writing to request sink", err, "connID", cr.ConnectionID)
+			if errors.Is(err, psrpc.ErrStreamClosed) {
+				// disconnect the participant WS since the signal proxy has been broken
+				return
+			}
 		}
 	}
 }
@@ -487,10 +518,16 @@ type connectionResult struct {
 	ResponseSource routing.MessageSource
 }
 
-func (s *RTCService) startConnection(ctx context.Context, roomName livekit.RoomName, pi routing.ParticipantInit, timeout time.Duration) (connectionResult, *livekit.SignalResponse, error) {
+func (s *RTCService) startConnection(
+	ctx context.Context,
+	roomName livekit.RoomName,
+	pi routing.ParticipantInit,
+	timeout time.Duration,
+) (connectionResult, *livekit.SignalResponse, error) {
 	var cr connectionResult
+	var created bool
 	var err error
-	cr.Room, err = s.roomAllocator.CreateRoom(ctx, &livekit.CreateRoomRequest{Name: string(roomName)})
+	cr.Room, created, err = s.roomAllocator.CreateRoom(ctx, &livekit.CreateRoomRequest{Name: string(roomName)})
 	if err != nil {
 		return cr, nil, err
 	}
@@ -511,6 +548,17 @@ func (s *RTCService) startConnection(ctx context.Context, roomName livekit.RoomN
 		cr.ResponseSource.Close()
 		return cr, nil, err
 	}
+
+	if created && s.agentClient != nil {
+		go func() {
+			s.agentClient.JobRequest(ctx, &livekit.Job{
+				Id:   putil.NewGuid("JR_"),
+				Type: livekit.JobType_JT_ROOM,
+				Room: cr.Room,
+			})
+		}()
+	}
+
 	return cr, initialResponse, nil
 }
 
@@ -532,5 +580,4 @@ func readInitialResponse(source routing.MessageSource, timeout time.Duration) (*
 			return res, nil
 		}
 	}
-
 }

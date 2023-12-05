@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package streamallocator
 
 import (
@@ -22,8 +36,6 @@ import (
 const (
 	ChannelCapacityInfinity = 100 * 1000 * 1000 // 100 Mbps
 
-	NackRatioAttenuator = 0.4 // how much to attenuate NACK ratio while calculating loss adjusted estimate
-
 	PriorityMin                = uint8(1)
 	PriorityMax                = uint8(255)
 	PriorityDefaultScreenshare = PriorityMax
@@ -35,32 +47,6 @@ const (
 	FlagAllowOvershootInProbe                   = true
 	FlagAllowOvershootInCatchup                 = false
 	FlagAllowOvershootInBoost                   = true
-)
-
-// ---------------------------------------------------------------------------
-
-var (
-	ChannelObserverParamsProbe = ChannelObserverParams{
-		Name:                           "probe",
-		EstimateRequiredSamples:        3,
-		EstimateDownwardTrendThreshold: 0.0,
-		EstimateCollapseThreshold:      0,
-		EstimateValidityWindow:         10 * time.Second,
-		NackWindowMinDuration:          500 * time.Millisecond,
-		NackWindowMaxDuration:          1 * time.Second,
-		NackRatioThreshold:             0.04,
-	}
-
-	ChannelObserverParamsNonProbe = ChannelObserverParams{
-		Name:                           "non-probe",
-		EstimateRequiredSamples:        8,
-		EstimateDownwardTrendThreshold: -0.5,
-		EstimateCollapseThreshold:      500 * time.Millisecond,
-		EstimateValidityWindow:         10 * time.Second,
-		NackWindowMinDuration:          1 * time.Second,
-		NackWindowMaxDuration:          2 * time.Second,
-		NackRatioThreshold:             0.08,
-	}
 )
 
 // ---------------------------------------------------------------------------
@@ -79,7 +65,7 @@ func (s streamAllocatorState) String() string {
 	case streamAllocatorStateDeficient:
 		return "DEFICIENT"
 	default:
-		return fmt.Sprintf("%d", int(s))
+		return fmt.Sprintf("UNKNOWN: %d", int(s))
 	}
 }
 
@@ -513,6 +499,34 @@ func (s *StreamAllocator) OnActiveChanged(isActive bool) {
 	}
 }
 
+// called to check if track should participate in BWE
+func (s *StreamAllocator) IsBWEEnabled(downTrack *sfu.DownTrack) bool {
+	if !s.params.Config.DisableEstimationUnmanagedTracks {
+		return true
+	}
+
+	s.videoTracksMu.Lock()
+	defer s.videoTracksMu.Unlock()
+
+	if track := s.videoTracks[livekit.TrackID(downTrack.ID())]; track != nil {
+		return track.IsManaged()
+	}
+
+	return true
+}
+
+// called to check if track subscription mute can be applied
+func (s *StreamAllocator) IsSubscribeMutable(downTrack *sfu.DownTrack) bool {
+	s.videoTracksMu.Lock()
+	defer s.videoTracksMu.Unlock()
+
+	if track := s.videoTracks[livekit.TrackID(downTrack.ID())]; track != nil {
+		return track.IsSubscribeMutable()
+	}
+
+	return true
+}
+
 func (s *StreamAllocator) maybePostEventAllocateTrack(downTrack *sfu.DownTrack) {
 	shouldPost := false
 	s.videoTracksMu.Lock()
@@ -548,6 +562,10 @@ func (s *StreamAllocator) postEvent(event Event) {
 
 func (s *StreamAllocator) processEvents() {
 	for event := range s.eventCh {
+		if s.isStopped.Load() {
+			break
+		}
+
 		s.handleEvent(&event)
 	}
 
@@ -692,8 +710,8 @@ func (s *StreamAllocator) handleSignalResume(event *Event) {
 
 	if track != nil {
 		update := NewStreamStateUpdate()
-		if track.SetPaused(false) {
-			update.HandleStreamingChange(false, track)
+		if track.SetStreamState(StreamStateActive) {
+			update.HandleStreamingChange(track, StreamStateActive)
 		}
 		s.maybeSendUpdate(update)
 	}
@@ -793,30 +811,42 @@ func (s *StreamAllocator) handleNewEstimateInNonProbe() {
 	expectedBandwidthUsage := s.getExpectedBandwidthUsage()
 	switch reason {
 	case ChannelCongestionReasonLoss:
-		estimateToCommit = int64(float64(expectedBandwidthUsage) * (1.0 - NackRatioAttenuator*s.channelObserver.GetNackRatio()))
-		if estimateToCommit > s.lastReceivedEstimate {
-			estimateToCommit = s.lastReceivedEstimate
-		}
+		estimateToCommit = int64(float64(expectedBandwidthUsage) * (1.0 - s.params.Config.NackRatioAttenuator*s.channelObserver.GetNackRatio()))
 	default:
 		estimateToCommit = s.lastReceivedEstimate
 	}
+	if estimateToCommit > s.lastReceivedEstimate {
+		estimateToCommit = s.lastReceivedEstimate
+	}
+
+	commitThreshold := int64(s.params.Config.ExpectedUsageThreshold * float64(expectedBandwidthUsage))
+	action := "applying"
+	if estimateToCommit > commitThreshold {
+		action = "skipping"
+	}
 
 	s.params.Logger.Infow(
-		"stream allocator: channel congestion detected, updating channel capacity",
+		fmt.Sprintf("stream allocator: channel congestion detected, %s channel capacity update", action),
 		"reason", reason,
 		"old(bps)", s.committedChannelCapacity,
 		"new(bps)", estimateToCommit,
 		"lastReceived(bps)", s.lastReceivedEstimate,
 		"expectedUsage(bps)", expectedBandwidthUsage,
+		"commitThreshold(bps)", commitThreshold,
 		"channel", s.channelObserver.ToString(),
 	)
 	s.params.Logger.Infow(
-		"stream allocator: channel congestion detected, updating channel capacity: experimental",
+		fmt.Sprintf("stream allocator: channel congestion detected, %s channel capacity: experimental", action),
 		"rateHistory", s.rateMonitor.GetHistory(),
 		"expectedQueuing", s.rateMonitor.GetQueuingGuess(),
 		"nackHistory", s.channelObserver.GetNackHistory(),
 		"trackHistory", s.getTracksHistory(),
 	)
+	if estimateToCommit > commitThreshold {
+		// estimate to commit is either higher or within tolerance of expected uage, skip committing and re-allocating
+		return
+	}
+
 	s.committedChannelCapacity = estimateToCommit
 
 	// reset to get new set of samples for next trend
@@ -836,51 +866,107 @@ func (s *StreamAllocator) allocateTrack(track *Track) {
 	if !s.params.Config.Enabled || s.state == streamAllocatorStateStable || !track.IsManaged() {
 		update := NewStreamStateUpdate()
 		allocation := track.AllocateOptimal(FlagAllowOvershootWhileOptimal)
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+		updateStreamStateChange(track, allocation, update)
 		s.maybeSendUpdate(update)
 		return
 	}
 
 	//
 	// In DEFICIENT state,
-	//   1. Find cooperative transition from track that needs allocation.
-	//   2. If track is currently streaming at minimum, do not do anything.
-	//   3. If that track is giving back bits, apply the transition.
-	//   4. If this track needs more, ask for best offer from others and try to use it.
+	//   Two possibilities
+	//   1. Available headroom is enough to accommodate track that needs change.
+	//      Note that the track could be muted, hence stopping.
+	//   2. Have to steal bits from other tracks currently streaming.
+	//
+	//   For both cases, do
+	//     a. Find cooperative transition from track that needs allocation.
+	//     b. If track is giving back bits, apply the transition and use bits given
+	//        back to boost any deficient track(s).
+	//
+	//   If track needs more bits, i.e. upward transition (may need resume or higher layer subscription),
+	//     a. Try to allocate using existing headroom. This can be tried to get the best
+	//        possible fit for the available headroom.
+	//     b. If there is not enough headroom to allocate anything, ask for best offer from
+	//        other tracks that are currently streaming and try to use it. This is done only if the
+	//        track needing change is not currently streaming, i. e. it has to be resumed.
 	//
 	track.ProvisionalAllocatePrepare()
 	transition := track.ProvisionalAllocateGetCooperativeTransition(FlagAllowOvershootWhileDeficient)
-
-	// track is currently streaming at minimum
-	if transition.BandwidthDelta == 0 {
-		return
-	}
 
 	// downgrade, giving back bits
 	if transition.From.GreaterThan(transition.To) {
 		allocation := track.ProvisionalAllocateCommit()
 
 		update := NewStreamStateUpdate()
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+		updateStreamStateChange(track, allocation, update)
 		s.maybeSendUpdate(update)
 
 		s.adjustState()
-		return
-		// STREAM-ALLOCATOR-TODO-START
-		// Should use the bits given back to start any paused track.
+
+		// Use the bits given back to boost deficient track(s).
 		// Note layer downgrade may actually have positive delta (i.e. consume more bits)
-		// because of when the measurement is done. Watch for that.
-		// STREAM_ALLOCATOR-TODO-END
+		// because of when the measurement is done. But, only available headroom after
+		// applying the transition will be used to boost deficient track(s).
+		s.maybeBoostDeficientTracks()
+		return
 	}
 
-	//
-	// This track is currently not streaming and needs bits to start.
-	// Try to redistribute starting with tracks that are closest to their desired.
-	//
+	// a no-op transition
+	if transition.From == transition.To {
+		return
+	}
+
+	// this track is currently not streaming and needs bits to start OR streaming at some layer and wants more bits.
+	// NOTE: With co-operative transition, tracks should not be asking for more if already streaming, but handle that case any way.
+	// first try an allocation using available headroom, current consumption of this track is discounted to calculate headroom.
+	availableChannelCapacity := s.getAvailableHeadroomWithoutTracks(false, []*Track{track})
+	if availableChannelCapacity > 0 {
+		track.ProvisionalAllocateReset() // to reset allocation from co-operative transition above and try fresh
+
+		bestLayer := buffer.InvalidLayer
+
+	alloc_loop:
+		for spatial := int32(0); spatial <= buffer.DefaultMaxLayerSpatial; spatial++ {
+			for temporal := int32(0); temporal <= buffer.DefaultMaxLayerTemporal; temporal++ {
+				layer := buffer.VideoLayer{
+					Spatial:  spatial,
+					Temporal: temporal,
+				}
+
+				isCandidate, usedChannelCapacity := track.ProvisionalAllocate(
+					availableChannelCapacity,
+					layer,
+					s.allowPause,
+					FlagAllowOvershootWhileDeficient,
+				)
+				if availableChannelCapacity < usedChannelCapacity {
+					break alloc_loop
+				}
+
+				if isCandidate {
+					bestLayer = layer
+				}
+			}
+		}
+
+		if bestLayer.IsValid() {
+			if bestLayer.GreaterThan(transition.From) {
+				// found layer that can fit in available headroom, take it if it is better than existing
+				update := NewStreamStateUpdate()
+				allocation := track.ProvisionalAllocateCommit()
+				updateStreamStateChange(track, allocation, update)
+				s.maybeSendUpdate(update)
+			}
+
+			s.adjustState()
+			return
+		}
+
+		track.ProvisionalAllocateReset()
+		transition = track.ProvisionalAllocateGetCooperativeTransition(FlagAllowOvershootWhileDeficient) // get transition again to reset above allocation attempt using available headroom
+	}
+
+	// if there is not enough headroom, try to redistribute starting with tracks that are closest to their desired.
 	bandwidthAcquired := int64(0)
 	var contributingTracks []*Track
 
@@ -906,9 +992,7 @@ func (s *StreamAllocator) allocateTrack(track *Track) {
 		// commit the tracks that contributed
 		for _, t := range contributingTracks {
 			allocation := t.ProvisionalAllocateCommit()
-			if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-				update.HandleStreamingChange(true, t)
-			}
+			updateStreamStateChange(t, allocation, update)
 		}
 
 		// STREAM-ALLOCATOR-TODO if got too much extra, can potentially give it to some deficient track
@@ -917,9 +1001,11 @@ func (s *StreamAllocator) allocateTrack(track *Track) {
 	// commit the track that needs change if enough could be acquired or pause not allowed
 	if !s.allowPause || bandwidthAcquired >= transition.BandwidthDelta {
 		allocation := track.ProvisionalAllocateCommit()
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+		updateStreamStateChange(track, allocation, update)
+	} else {
+		// explicitly pause to ensure stream state update happens if a track coming out of mute cannot be allocated
+		allocation := track.Pause()
+		updateStreamStateChange(track, allocation, update)
 	}
 
 	s.maybeSendUpdate(update)
@@ -943,7 +1029,7 @@ func (s *StreamAllocator) onProbeDone(isNotFailing bool, isGoalReached bool) {
 	//
 	channelObserverString := s.channelObserver.ToString()
 	s.channelObserver = s.newChannelObserverNonProbe()
-	s.params.Logger.Infow(
+	s.params.Logger.Debugw(
 		"probe done",
 		"isNotFailing", isNotFailing,
 		"isGoalReached", isGoalReached,
@@ -963,35 +1049,38 @@ func (s *StreamAllocator) onProbeDone(isNotFailing bool, isGoalReached bool) {
 }
 
 func (s *StreamAllocator) maybeBoostDeficientTracks() {
-	committedChannelCapacity := s.committedChannelCapacity
-	if s.params.Config.MinChannelCapacity > committedChannelCapacity {
-		committedChannelCapacity = s.params.Config.MinChannelCapacity
-		s.params.Logger.Debugw(
-			"stream allocator: overriding channel capacity",
-			"actual", s.committedChannelCapacity,
-			"override", committedChannelCapacity,
-		)
-	}
-	availableChannelCapacity := committedChannelCapacity - s.getExpectedBandwidthUsage()
+	availableChannelCapacity := s.getAvailableHeadroom(false)
 	if availableChannelCapacity <= 0 {
 		return
 	}
 
 	update := NewStreamStateUpdate()
 
-	for _, track := range s.getMaxDistanceSortedDeficient() {
-		allocation, boosted := track.AllocateNextHigher(availableChannelCapacity, FlagAllowOvershootInCatchup)
-		if !boosted {
-			continue
-		}
+	sortedTracks := s.getMaxDistanceSortedDeficient()
+boost_loop:
+	for {
+		for idx, track := range sortedTracks {
+			allocation, boosted := track.AllocateNextHigher(availableChannelCapacity, FlagAllowOvershootInCatchup)
+			if !boosted {
+				if idx == len(sortedTracks)-1 {
+					// all tracks tried
+					break boost_loop
+				}
+				continue
+			}
 
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+			updateStreamStateChange(track, allocation, update)
 
-		availableChannelCapacity -= allocation.BandwidthDelta
-		if availableChannelCapacity <= 0 {
-			break
+			availableChannelCapacity -= allocation.BandwidthDelta
+			if availableChannelCapacity <= 0 {
+				break boost_loop
+			}
+
+			break // sort again below as the track that was just boosted could still be farthest from its desired
+		}
+		sortedTracks = s.getMaxDistanceSortedDeficient()
+		if len(sortedTracks) == 0 {
+			break // nothing available to boost
 		}
 	}
 
@@ -1020,23 +1109,7 @@ func (s *StreamAllocator) allocateAllTracks() {
 	//
 	update := NewStreamStateUpdate()
 
-	availableChannelCapacity := s.committedChannelCapacity
-	if s.params.Config.MinChannelCapacity > availableChannelCapacity {
-		availableChannelCapacity = s.params.Config.MinChannelCapacity
-		s.params.Logger.Debugw(
-			"stream allocator: overriding channel capacity with min channel capacity",
-			"actual", s.committedChannelCapacity,
-			"override", availableChannelCapacity,
-		)
-	}
-	if s.overriddenChannelCapacity > 0 {
-		availableChannelCapacity = s.overriddenChannelCapacity
-		s.params.Logger.Debugw(
-			"stream allocator: overriding channel capacity",
-			"actual", s.committedChannelCapacity,
-			"override", availableChannelCapacity,
-		)
-	}
+	availableChannelCapacity := s.getAvailableChannelCapacity(true)
 
 	//
 	// This pass is to find out if there is any leftover channel capacity after allocating exempt tracks.
@@ -1049,12 +1122,12 @@ func (s *StreamAllocator) allocateAllTracks() {
 		}
 
 		allocation := track.AllocateOptimal(FlagAllowOvershootExemptTrackWhileDeficient)
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+		updateStreamStateChange(track, allocation, update)
 
 		// STREAM-ALLOCATOR-TODO: optimistic allocation before bitrate is available will return 0. How to account for that?
-		availableChannelCapacity -= allocation.BandwidthRequested
+		if !s.params.Config.DisableEstimationUnmanagedTracks {
+			availableChannelCapacity -= allocation.BandwidthRequested
+		}
 	}
 
 	if availableChannelCapacity < 0 {
@@ -1068,9 +1141,7 @@ func (s *StreamAllocator) allocateAllTracks() {
 			}
 
 			allocation := track.Pause()
-			if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-				update.HandleStreamingChange(true, track)
-			}
+			updateStreamStateChange(track, allocation, update)
 		}
 	} else {
 		sorted := s.getSorted()
@@ -1086,7 +1157,7 @@ func (s *StreamAllocator) allocateAllTracks() {
 				}
 
 				for _, track := range sorted {
-					usedChannelCapacity := track.ProvisionalAllocate(availableChannelCapacity, layer, s.allowPause, FlagAllowOvershootWhileDeficient)
+					_, usedChannelCapacity := track.ProvisionalAllocate(availableChannelCapacity, layer, s.allowPause, FlagAllowOvershootWhileDeficient)
 					availableChannelCapacity -= usedChannelCapacity
 					if availableChannelCapacity < 0 {
 						availableChannelCapacity = 0
@@ -1097,9 +1168,7 @@ func (s *StreamAllocator) allocateAllTracks() {
 
 		for _, track := range sorted {
 			allocation := track.ProvisionalAllocateCommit()
-			if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-				update.HandleStreamingChange(true, track)
-			}
+			updateStreamStateChange(track, allocation, update)
 		}
 	}
 
@@ -1128,6 +1197,28 @@ func (s *StreamAllocator) maybeSendUpdate(update *StreamStateUpdate) {
 	}
 }
 
+func (s *StreamAllocator) getAvailableChannelCapacity(allowOverride bool) int64 {
+	availableChannelCapacity := s.committedChannelCapacity
+	if s.params.Config.MinChannelCapacity > availableChannelCapacity {
+		availableChannelCapacity = s.params.Config.MinChannelCapacity
+		s.params.Logger.Debugw(
+			"stream allocator: overriding channel capacity with min channel capacity",
+			"actual", s.committedChannelCapacity,
+			"override", availableChannelCapacity,
+		)
+	}
+	if allowOverride && s.overriddenChannelCapacity > 0 {
+		availableChannelCapacity = s.overriddenChannelCapacity
+		s.params.Logger.Debugw(
+			"stream allocator: overriding channel capacity",
+			"actual", s.committedChannelCapacity,
+			"override", availableChannelCapacity,
+		)
+	}
+
+	return availableChannelCapacity
+}
+
 func (s *StreamAllocator) getExpectedBandwidthUsage() int64 {
 	expected := int64(0)
 	for _, track := range s.getTracks() {
@@ -1135,6 +1226,32 @@ func (s *StreamAllocator) getExpectedBandwidthUsage() int64 {
 	}
 
 	return expected
+}
+
+func (s *StreamAllocator) getExpectedBandwidthUsageWithoutTracks(filteredTracks []*Track) int64 {
+	expected := int64(0)
+	for _, track := range s.getTracks() {
+		filtered := false
+		for _, ft := range filteredTracks {
+			if ft == track {
+				filtered = true
+				break
+			}
+		}
+		if !filtered {
+			expected += track.BandwidthRequested()
+		}
+	}
+
+	return expected
+}
+
+func (s *StreamAllocator) getAvailableHeadroom(allowOverride bool) int64 {
+	return s.getAvailableChannelCapacity(allowOverride) - s.getExpectedBandwidthUsage()
+}
+
+func (s *StreamAllocator) getAvailableHeadroomWithoutTracks(allowOverride bool, filteredTracks []*Track) int64 {
+	return s.getAvailableChannelCapacity(allowOverride) - s.getExpectedBandwidthUsageWithoutTracks(filteredTracks)
 }
 
 func (s *StreamAllocator) getNackDelta() (uint32, uint32) {
@@ -1150,29 +1267,27 @@ func (s *StreamAllocator) getNackDelta() (uint32, uint32) {
 }
 
 func (s *StreamAllocator) newChannelObserverProbe() *ChannelObserver {
-	return NewChannelObserver(ChannelObserverParamsProbe, s.params.Logger)
+	return NewChannelObserver(
+		ChannelObserverParams{
+			Name:   "probe",
+			Config: s.params.Config.ChannelObserverProbeConfig,
+		},
+		s.params.Logger,
+	)
 }
 
 func (s *StreamAllocator) newChannelObserverNonProbe() *ChannelObserver {
-	return NewChannelObserver(ChannelObserverParamsNonProbe, s.params.Logger)
+	return NewChannelObserver(
+		ChannelObserverParams{
+			Name:   "non-probe",
+			Config: s.params.Config.ChannelObserverNonProbeConfig,
+		},
+		s.params.Logger,
+	)
 }
 
 func (s *StreamAllocator) initProbe(probeGoalDeltaBps int64) {
 	expectedBandwidthUsage := s.getExpectedBandwidthUsage()
-	if float64(expectedBandwidthUsage) > 1.5*float64(s.committedChannelCapacity) {
-		// STREAM-ALLOCATOR-TODO-START
-		// Should probably skip probing if the expected usage is much higher than committed channel capacity.
-		// But, give that bandwidth estimate is volatile at times and can drop down to small values,
-		// not probing means streaming stuck in a well for long.
-		// Observe this and figure out if there is a threshold from practical use cases that can be used to
-		// skip probing safely
-		// STREAM-ALLOCATOR-TODO-END
-		s.params.Logger.Warnw(
-			"stream allocator: starting probe alarm",
-			fmt.Errorf("expected too high, expected: %d, committed: %d", expectedBandwidthUsage, s.committedChannelCapacity),
-		)
-	}
-
 	probeClusterId, probeGoalBps := s.probeController.InitProbe(probeGoalDeltaBps, expectedBandwidthUsage)
 
 	channelState := ""
@@ -1221,9 +1336,7 @@ func (s *StreamAllocator) maybeProbeWithMedia() {
 		}
 
 		update := NewStreamStateUpdate()
-		if allocation.PauseReason == sfu.VideoPauseReasonBandwidth && track.SetPaused(true) {
-			update.HandleStreamingChange(true, track)
-		}
+		updateStreamStateChange(track, allocation, update)
 		s.maybeSendUpdate(update)
 
 		s.probeController.Reset()
@@ -1347,6 +1460,29 @@ func (s *StreamAllocator) getTracksHistory() map[livekit.TrackID]string {
 	}
 
 	return history
+}
+
+// ------------------------------------------------
+
+func updateStreamStateChange(track *Track, allocation sfu.VideoAllocation, update *StreamStateUpdate) {
+	updated := false
+	streamState := StreamStateInactive
+	switch allocation.PauseReason {
+	case sfu.VideoPauseReasonMuted:
+		fallthrough
+
+	case sfu.VideoPauseReasonPubMuted:
+		streamState = StreamStateInactive
+		updated = track.SetStreamState(streamState)
+
+	case sfu.VideoPauseReasonBandwidth:
+		streamState = StreamStatePaused
+		updated = track.SetStreamState(streamState)
+	}
+
+	if updated {
+		update.HandleStreamingChange(track, streamState)
+	}
 }
 
 // ------------------------------------------------
