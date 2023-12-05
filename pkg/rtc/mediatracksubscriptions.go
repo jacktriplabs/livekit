@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -8,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
 
+	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
@@ -122,15 +137,29 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 	for _, c := range codecs {
 		c.RTCPFeedback = rtcpFeedback
 	}
-	downTrack, err := sfu.NewDownTrack(
-		codecs,
-		wr,
-		sub.GetBufferFactory(),
-		subscriberID,
-		t.params.ReceiverConfig.PacketBufferSize,
-		sub.GetPacer(),
-		LoggerWithTrack(sub.GetLogger(), trackID, t.params.IsRelayed),
-	)
+
+	streamID := wr.StreamID()
+	if sub.SupportsSyncStreamID() && t.params.MediaTrack.Stream() != "" {
+		streamID = PackSyncStreamID(t.params.MediaTrack.PublisherID(), t.params.MediaTrack.Stream())
+	}
+
+	var trailer []byte
+	if t.params.MediaTrack.IsEncrypted() {
+		trailer = sub.GetTrailer()
+	}
+
+	downTrack, err := sfu.NewDownTrack(sfu.DowntrackParams{
+		Codecs:            codecs,
+		Receiver:          wr,
+		BufferFactory:     sub.GetBufferFactory(),
+		SubID:             subscriberID,
+		StreamID:          streamID,
+		MaxTrack:          t.params.ReceiverConfig.PacketBufferSize,
+		PlayoutDelayLimit: sub.GetPlayoutDelayConfig(),
+		Pacer:             sub.GetPacer(),
+		Trailer:           trailer,
+		Logger:            LoggerWithTrack(sub.GetLogger().WithComponent(sutils.ComponentSub), trackID, t.params.IsRelayed),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +234,8 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 		reusingTransceiver.Store(true)
 		rtpSender := existingTransceiver.Sender()
 		if rtpSender != nil {
+			// replaced track will bind immediately without negotiation, SetTransceiver first before bind
+			downTrack.SetTransceiver(existingTransceiver)
 			err := rtpSender.ReplaceTrack(downTrack)
 			if err == nil {
 				sender = rtpSender
@@ -239,7 +270,7 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 		}
 
 		sub.VerifySubscribeParticipantInfo(subTrack.PublisherID(), subTrack.PublisherVersion())
-		if sub.ProtocolVersion().SupportsTransceiverReuse() {
+		if sub.SupportsTransceiverReuse() {
 			//
 			// AddTrack will create a new transceiver or re-use an unused one
 			// if the attributes match. This prevents SDP from bloating
@@ -264,9 +295,6 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 	// negotiation isn't required if we've replaced track
 	subTrack.SetNeedsNegotiation(!replacedTrack)
 	subTrack.SetRTPSender(sender)
-
-	sendParameters := sender.GetParameters()
-	downTrack.SetRTPHeaderExtensions(sendParameters.HeaderExtensions)
 
 	downTrack.SetTransceiver(transceiver)
 
@@ -300,14 +328,18 @@ func (t *MediaTrackSubscriptions) closeSubscribedTrack(subTrack types.Subscribed
 		return
 	}
 
-	dt.CloseWithFlush(!willBeResumed)
-
 	if willBeResumed {
+		dt.CloseWithFlush(false)
+
+		// cache transceiver for potential re-use on resume
 		tr := dt.GetTransceiver()
 		if tr != nil {
 			sub := subTrack.Subscriber()
 			sub.CacheDownTrack(subTrack.ID(), tr, dt.GetState())
 		}
+	} else {
+		// flushing blocks, avoid blocking when publisher removes all its subscribers
+		go dt.CloseWithFlush(true)
 	}
 }
 

@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package config
 
 import (
@@ -15,8 +29,8 @@ import (
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/logger/pionlogger"
 	redisLiveKit "github.com/livekit/protocol/redis"
+	"github.com/livekit/protocol/rpc"
 )
 
 type CongestionControlProbeMode string
@@ -36,12 +50,12 @@ const (
 )
 
 var (
-	ErrKeyFileIncorrectPermission = errors.New("key file must have 0600 permission")
+	ErrKeyFileIncorrectPermission = errors.New("key file others permissions must be set to 0")
 	ErrKeysNotSet                 = errors.New("one of key-file or keys must be provided")
 )
 
 type Config struct {
-	Port           uint32                   `yaml:"port"`
+	Port           uint32                   `yaml:"port,omitempty"`
 	BindAddresses  []string                 `yaml:"bind_addresses,omitempty"`
 	PrometheusPort uint32                   `yaml:"prometheus_port,omitempty"`
 	Environment    string                   `yaml:"environment,omitempty"`
@@ -58,6 +72,7 @@ type Config struct {
 	Keys           map[string]string        `yaml:"keys,omitempty"`
 	Region         string                   `yaml:"region,omitempty"`
 	SignalRelay    SignalRelayConfig        `yaml:"signal_relay,omitempty"`
+	PSRPC          rpc.PSRPCConfig          `yaml:"psrpc,omitempty"`
 	// LogLevel is deprecated
 	LogLevel string        `yaml:"log_level,omitempty"`
 	Logging  LoggingConfig `yaml:"logging,omitempty"`
@@ -89,12 +104,18 @@ type RTCConfig struct {
 
 	// force a reconnect on a subscription error
 	ReconnectOnSubscriptionError *bool `yaml:"reconnect_on_subscription_error,omitempty"`
+
+	// force a reconnect on a data channel error
+	ReconnectOnDataChannelError *bool `yaml:"reconnect_on_data_channel_error,omitempty"`
+
+	// max number of bytes to buffer for data channel. 0 means unlimited
+	DataChannelMaxBufferedAmount uint64 `yaml:"data_channel_max_buffered_amount,omitempty"`
 }
 
 type TURNServer struct {
-	Host       string `yaml:"host"`
-	Port       int    `yaml:"port"`
-	Protocol   string `yaml:"protocol"`
+	Host       string `yaml:"host,omitempty"`
+	Port       int    `yaml:"port,omitempty"`
+	Protocol   string `yaml:"protocol,omitempty"`
 	Username   string `yaml:"username,omitempty"`
 	Credential string `yaml:"credential,omitempty"`
 }
@@ -123,13 +144,30 @@ type CongestionControlProbeConfig struct {
 	DurationIncreaseFactor float64       `yaml:"duration_increase_factor,omitempty"`
 }
 
+type CongestionControlChannelObserverConfig struct {
+	EstimateRequiredSamples        int           `yaml:"estimate_required_samples,omitempty"`
+	EstimateRequiredSamplesMin     int           `yaml:"estimate_required_samples_min,omitempty"`
+	EstimateDownwardTrendThreshold float64       `yaml:"estimate_downward_trend_threshold,omitempty"`
+	EstimateDownwardTrendMaxWait   time.Duration `yaml:"estimate_downward_trend_max_wait,omitempty"`
+	EstimateCollapseThreshold      time.Duration `yaml:"estimate_collapse_threshold,omitempty"`
+	EstimateValidityWindow         time.Duration `yaml:"estimate_validity_window,omitempty"`
+	NackWindowMinDuration          time.Duration `yaml:"nack_window_min_duration,omitempty"`
+	NackWindowMaxDuration          time.Duration `yaml:"nack_window_max_duration,omitempty"`
+	NackRatioThreshold             float64       `yaml:"nack_ratio_threshold,omitempty"`
+}
+
 type CongestionControlConfig struct {
-	Enabled            bool                         `yaml:"enabled"`
-	AllowPause         bool                         `yaml:"allow_pause"`
-	UseSendSideBWE     bool                         `yaml:"send_side_bandwidth_estimation,omitempty"`
-	ProbeMode          CongestionControlProbeMode   `yaml:"padding_mode,omitempty"`
-	MinChannelCapacity int64                        `yaml:"min_channel_capacity,omitempty"`
-	ProbeConfig        CongestionControlProbeConfig `yaml:"probe_config,omitempty"`
+	Enabled                          bool                                   `yaml:"enabled,omitempty"`
+	AllowPause                       bool                                   `yaml:"allow_pause,omitempty"`
+	NackRatioAttenuator              float64                                `yaml:"nack_ratio_attenuator,omitempty"`
+	ExpectedUsageThreshold           float64                                `yaml:"expected_usage_threshold,omitempty"`
+	UseSendSideBWE                   bool                                   `yaml:"send_side_bandwidth_estimation,omitempty"`
+	ProbeMode                        CongestionControlProbeMode             `yaml:"probe_mode,omitempty"`
+	MinChannelCapacity               int64                                  `yaml:"min_channel_capacity,omitempty"`
+	ProbeConfig                      CongestionControlProbeConfig           `yaml:"probe_config,omitempty"`
+	ChannelObserverProbeConfig       CongestionControlChannelObserverConfig `yaml:"channel_observer_probe_config,omitempty"`
+	ChannelObserverNonProbeConfig    CongestionControlChannelObserverConfig `yaml:"channel_observer_non_probe_config,omitempty"`
+	DisableEstimationUnmanagedTracks bool                                   `yaml:"disable_etimation_unmanaged_tracks,omitempty"`
 }
 
 type AudioConfig struct {
@@ -154,7 +192,7 @@ type StreamTrackerPacketConfig struct {
 }
 
 type StreamTrackerFrameConfig struct {
-	MinFPS float64 `yaml:"min_fps"`
+	MinFPS float64 `yaml:"min_fps,omitempty"`
 }
 
 type StreamTrackerConfig struct {
@@ -169,6 +207,12 @@ type StreamTrackersConfig struct {
 	Screenshare StreamTrackerConfig `yaml:"screenshare,omitempty"`
 }
 
+type PlayoutDelayConfig struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	Min     int  `yaml:"min,omitempty"`
+	Max     int  `yaml:"max,omitempty"`
+}
+
 type VideoConfig struct {
 	DynacastPauseDelay time.Duration        `yaml:"dynacast_pause_delay,omitempty"`
 	StreamTracker      StreamTrackersConfig `yaml:"stream_tracker,omitempty"`
@@ -176,17 +220,19 @@ type VideoConfig struct {
 
 type RoomConfig struct {
 	// enable rooms to be automatically created
-	AutoCreate         bool        `yaml:"auto_create,omitempty"`
-	EnabledCodecs      []CodecSpec `yaml:"enabled_codecs,omitempty"`
-	MaxParticipants    uint32      `yaml:"max_participants,omitempty"`
-	EmptyTimeout       uint32      `yaml:"empty_timeout,omitempty"`
-	EnableRemoteUnmute bool        `yaml:"enable_remote_unmute,omitempty"`
-	MaxMetadataSize    uint32      `yaml:"max_metadata_size,omitempty"`
+	AutoCreate         bool               `yaml:"auto_create,omitempty"`
+	EnabledCodecs      []CodecSpec        `yaml:"enabled_codecs,omitempty"`
+	MaxParticipants    uint32             `yaml:"max_participants,omitempty"`
+	EmptyTimeout       uint32             `yaml:"empty_timeout,omitempty"`
+	EnableRemoteUnmute bool               `yaml:"enable_remote_unmute,omitempty"`
+	MaxMetadataSize    uint32             `yaml:"max_metadata_size,omitempty"`
+	PlayoutDelay       PlayoutDelayConfig `yaml:"playout_delay,omitempty"`
+	SyncStreams        bool               `yaml:"sync_streams,omitempty"`
 }
 
 type CodecSpec struct {
-	Mime     string `yaml:"mime"`
-	FmtpLine string `yaml:"fmtp_line"`
+	Mime     string `yaml:"mime,omitempty"`
+	FmtpLine string `yaml:"fmtp_line,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -195,7 +241,7 @@ type LoggingConfig struct {
 }
 
 type TURNConfig struct {
-	Enabled             bool   `yaml:"enabled"`
+	Enabled             bool   `yaml:"enabled,omitempty"`
 	Domain              string `yaml:"domain,omitempty"`
 	CertFile            string `yaml:"cert_file,omitempty"`
 	KeyFile             string `yaml:"key_file,omitempty"`
@@ -207,13 +253,13 @@ type TURNConfig struct {
 }
 
 type WebHookConfig struct {
-	URLs []string `yaml:"urls"`
+	URLs []string `yaml:"urls,omitempty"`
 	// key to use for webhook
-	APIKey string `yaml:"api_key"`
+	APIKey string `yaml:"api_key,omitempty"`
 }
 
 type NodeSelectorConfig struct {
-	Kind         string         `yaml:"kind"`
+	Kind         string         `yaml:"kind,omitempty"`
 	SortBy       string         `yaml:"sort_by,omitempty"`
 	CPULoadLimit float32        `yaml:"cpu_load_limit,omitempty"`
 	SysloadLimit float32        `yaml:"sysload_limit,omitempty"`
@@ -221,7 +267,7 @@ type NodeSelectorConfig struct {
 }
 
 type SignalRelayConfig struct {
-	Enabled          bool          `yaml:"enabled"`
+	Enabled          bool          `yaml:"enabled,omitempty"`
 	RetryTimeout     time.Duration `yaml:"retry_timeout,omitempty"`
 	MinRetryInterval time.Duration `yaml:"min_retry_interval,omitempty"`
 	MaxRetryInterval time.Duration `yaml:"max_retry_interval,omitempty"`
@@ -231,9 +277,9 @@ type SignalRelayConfig struct {
 // RegionConfig lists available regions and their latitude/longitude, so the selector would prefer
 // regions that are closer
 type RegionConfig struct {
-	Name string  `yaml:"name"`
-	Lat  float64 `yaml:"lat"`
-	Lon  float64 `yaml:"lon"`
+	Name string  `yaml:"name,omitempty"`
+	Lat  float64 `yaml:"lat,omitempty"`
+	Lon  float64 `yaml:"lon,omitempty"`
 }
 
 type LimitConfig struct {
@@ -244,8 +290,8 @@ type LimitConfig struct {
 }
 
 type IngressConfig struct {
-	RTMPBaseURL string `yaml:"rtmp_base_url"`
-	WHIPBaseURL string `yaml:"whip_base_url"`
+	RTMPBaseURL string `yaml:"rtmp_base_url,omitempty"`
+	WHIPBaseURL string `yaml:"whip_base_url,omitempty"`
 }
 
 // not exposed to YAML
@@ -270,7 +316,6 @@ var DefaultConfig = Config{
 		RTCConfig: rtcconfig.RTCConfig{
 			UseExternalIP:     false,
 			TCPPort:           7881,
-			UDPPort:           0,
 			ICEPortRangeStart: 0,
 			ICEPortRangeEnd:   0,
 			STUNServers:       []string{},
@@ -283,9 +328,11 @@ var DefaultConfig = Config{
 			HighQuality: time.Second,
 		},
 		CongestionControl: CongestionControlConfig{
-			Enabled:    true,
-			AllowPause: false,
-			ProbeMode:  CongestionControlProbeModePadding,
+			Enabled:                true,
+			AllowPause:             false,
+			NackRatioAttenuator:    0.4,
+			ExpectedUsageThreshold: 0.95,
+			ProbeMode:              CongestionControlProbeModePadding,
 			ProbeConfig: CongestionControlProbeConfig{
 				BaseInterval:  3 * time.Second,
 				BackoffFactor: 1.5,
@@ -302,6 +349,28 @@ var DefaultConfig = Config{
 				MaxDuration:            20 * time.Second,
 				DurationOverflowFactor: 1.25,
 				DurationIncreaseFactor: 1.5,
+			},
+			ChannelObserverProbeConfig: CongestionControlChannelObserverConfig{
+				EstimateRequiredSamples:        3,
+				EstimateRequiredSamplesMin:     3,
+				EstimateDownwardTrendThreshold: 0.0,
+				EstimateDownwardTrendMaxWait:   5 * time.Second,
+				EstimateCollapseThreshold:      0,
+				EstimateValidityWindow:         10 * time.Second,
+				NackWindowMinDuration:          500 * time.Millisecond,
+				NackWindowMaxDuration:          1 * time.Second,
+				NackRatioThreshold:             0.04,
+			},
+			ChannelObserverNonProbeConfig: CongestionControlChannelObserverConfig{
+				EstimateRequiredSamples:        12,
+				EstimateRequiredSamplesMin:     8,
+				EstimateDownwardTrendThreshold: -0.6,
+				EstimateDownwardTrendMaxWait:   5 * time.Second,
+				EstimateCollapseThreshold:      500 * time.Millisecond,
+				EstimateValidityWindow:         10 * time.Second,
+				NackWindowMinDuration:          2 * time.Second,
+				NackWindowMaxDuration:          3 * time.Second,
+				NackRatioThreshold:             0.08,
 			},
 		},
 	},
@@ -396,8 +465,8 @@ var DefaultConfig = Config{
 			{Mime: "audio/red"},
 			{Mime: webrtc.MimeTypeVP8},
 			{Mime: webrtc.MimeTypeH264},
-			// {Mime: webrtc.MimeTypeAV1},
-			// {Mime: webrtc.MimeTypeVP9},
+			{Mime: webrtc.MimeTypeVP9},
+			{Mime: webrtc.MimeTypeAV1},
 		},
 		EmptyTimeout: 5 * 60,
 	},
@@ -414,18 +483,29 @@ var DefaultConfig = Config{
 		CPULoadLimit: 0.9,
 	},
 	SignalRelay: SignalRelayConfig{
-		Enabled:          false,
+		Enabled:          true,
 		RetryTimeout:     7500 * time.Millisecond,
 		MinRetryInterval: 500 * time.Millisecond,
 		MaxRetryInterval: 4 * time.Second,
 		StreamBufferSize: 1000,
 	},
-	Keys: map[string]string{},
+	PSRPC: rpc.DefaultPSRPCConfig,
+	Keys:  map[string]string{},
 }
 
 func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []cli.Flag) (*Config, error) {
 	// start with defaults
-	conf := DefaultConfig
+	marshalled, err := yaml.Marshal(&DefaultConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	var conf Config
+	err = yaml.Unmarshal(marshalled, &conf)
+	if err != nil {
+		return nil, err
+	}
+
 	if confString != "" {
 		decoder := yaml.NewDecoder(strings.NewReader(confString))
 		decoder.KnownFields(strictMode)
@@ -468,6 +548,13 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 	}
 	if conf.Logging.Level == "" && conf.Development {
 		conf.Logging.Level = "debug"
+	}
+	if conf.Logging.PionLevel != "" {
+		if conf.Logging.ComponentLevels == nil {
+			conf.Logging.ComponentLevels = map[string]string{}
+		}
+		conf.Logging.ComponentLevels["transport.pion"] = conf.Logging.PionLevel
+		conf.Logging.ComponentLevels["pion"] = conf.Logging.PionLevel
 	}
 
 	if conf.Development {
@@ -547,9 +634,10 @@ func (conf *Config) ToCLIFlagNames(existingFlags []cli.Flag) map[string]reflect.
 func (conf *Config) ValidateKeys() error {
 	// prefer keyfile if set
 	if conf.KeyFile != "" {
+		var otherFilter os.FileMode = 0007
 		if st, err := os.Stat(conf.KeyFile); err != nil {
 			return err
-		} else if st.Mode().Perm() != 0600 {
+		} else if st.Mode().Perm()&otherFilter != 0000 {
 			return ErrKeyFileIncorrectPermission
 		}
 		f, err := os.Open(conf.KeyFile)
@@ -626,6 +714,13 @@ func GenerateCLIFlags(existingFlags []cli.Flag, hidden bool) ([]cli.Flag, error)
 				Usage:   generatedCLIFlagUsage,
 				Hidden:  hidden,
 			}
+		case reflect.Uint64:
+			flag = &cli.Uint64Flag{
+				Name:    name,
+				EnvVars: []string{envVar},
+				Usage:   generatedCLIFlagUsage,
+				Hidden:  hidden,
+			}
 		case reflect.Float32:
 			flag = &cli.Float64Flag{
 				Name:    name,
@@ -687,7 +782,7 @@ func (conf *Config) updateFromCLI(c *cli.Context, baseFlags []cli.Flag) error {
 			configValue.SetString(c.String(flagName))
 		case reflect.Int, reflect.Int32, reflect.Int64:
 			configValue.SetInt(c.Int64(flagName))
-		case reflect.Uint8, reflect.Uint16, reflect.Uint32:
+		case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 			configValue.SetUint(c.Uint64(flagName))
 		case reflect.Float32:
 			configValue.SetFloat(c.Float64(flagName))
@@ -732,7 +827,7 @@ func (conf *Config) updateFromCLI(c *cli.Context, baseFlags []cli.Flag) error {
 		conf.RTC.NodeIP = c.String("node-ip")
 	}
 	if c.IsSet("udp-port") {
-		conf.RTC.UDPPort = uint32(c.Int("udp-port"))
+		conf.RTC.UDPPort.UnmarshalString(c.String("udp-port"))
 	}
 	if c.IsSet("bind") {
 		conf.BindAddresses = c.StringSlice("bind")
@@ -761,7 +856,6 @@ func SetLogger(l logger.Logger) {
 	logger.SetLogger(l, "livekit")
 }
 
-func InitLoggerFromConfig(config LoggingConfig) {
-	pionlogger.SetLogLevel(config.PionLevel)
-	logger.InitFromConfig(config.Config, "livekit")
+func InitLoggerFromConfig(config *LoggingConfig) {
+	logger.InitFromConfig(&config.Config, "livekit")
 }

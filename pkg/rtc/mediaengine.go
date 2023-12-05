@@ -1,9 +1,24 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
 	"strings"
 
 	"github.com/pion/webrtc/v3"
+	"golang.org/x/exp/slices"
 
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/protocol/livekit"
@@ -12,7 +27,7 @@ import (
 var opusCodecCapability = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"}
 var redCodecCapability = webrtc.RTPCodecCapability{MimeType: sfu.MimeTypeAudioRed, ClockRate: 48000, Channels: 2, SDPFmtpLine: "111/111"}
 
-func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedback RTCPFeedbackConfig) error {
+func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedback RTCPFeedbackConfig, filterOutH264HighProfile bool) error {
 	opusCodec := opusCodecCapability
 	opusCodec.RTCPFeedback = rtcpFeedback.Audio
 	var opusPayload webrtc.PayloadType
@@ -35,6 +50,7 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 		}
 	}
 
+	h264HighProfileFmtp := "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032"
 	for _, codec := range []webrtc.RTPCodecParameters{
 		{
 			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, RTCPFeedback: rtcpFeedback.Video},
@@ -57,7 +73,7 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 			PayloadType:        108,
 		},
 		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032", RTCPFeedback: rtcpFeedback.Video},
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: h264HighProfileFmtp, RTCPFeedback: rtcpFeedback.Video},
 			PayloadType:        123,
 		},
 		{
@@ -65,6 +81,9 @@ func registerCodecs(me *webrtc.MediaEngine, codecs []*livekit.Codec, rtcpFeedbac
 			PayloadType:        35,
 		},
 	} {
+		if filterOutH264HighProfile && codec.RTPCodecCapability.SDPFmtpLine == h264HighProfileFmtp {
+			continue
+		}
 		if IsCodecEnabled(codecs, codec.RTPCodecCapability) {
 			if err := me.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
 				return err
@@ -90,9 +109,9 @@ func registerHeaderExtensions(me *webrtc.MediaEngine, rtpHeaderExtension RTPHead
 	return nil
 }
 
-func createMediaEngine(codecs []*livekit.Codec, config DirectionConfig) (*webrtc.MediaEngine, error) {
+func createMediaEngine(codecs []*livekit.Codec, config DirectionConfig, filterOutH264HighProfile bool) (*webrtc.MediaEngine, error) {
 	me := &webrtc.MediaEngine{}
-	if err := registerCodecs(me, codecs, config.RTCPFeedback); err != nil {
+	if err := registerCodecs(me, codecs, config.RTCPFeedback, filterOutH264HighProfile); err != nil {
 		return nil, err
 	}
 
@@ -113,4 +132,25 @@ func IsCodecEnabled(codecs []*livekit.Codec, cap webrtc.RTPCodecCapability) bool
 		}
 	}
 	return false
+}
+
+func selectAlternativeVideoCodec(enabledCodecs []*livekit.Codec) string {
+	// sort these by compatibility, since we are looking for backups
+	if slices.ContainsFunc(enabledCodecs, func(c *livekit.Codec) bool {
+		return strings.EqualFold(c.Mime, webrtc.MimeTypeVP8)
+	}) {
+		return webrtc.MimeTypeVP8
+	}
+	if slices.ContainsFunc(enabledCodecs, func(c *livekit.Codec) bool {
+		return strings.EqualFold(c.Mime, webrtc.MimeTypeH264)
+	}) {
+		return webrtc.MimeTypeH264
+	}
+	for _, c := range enabledCodecs {
+		if strings.HasPrefix(c.Mime, "video/") {
+			return c.Mime
+		}
+	}
+	// no viable codec in the list of enabled codecs, fall back to the most widely supported codec
+	return webrtc.MimeTypeVP8
 }

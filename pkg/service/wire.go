@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build wireinject
 // +build wireinject
 
@@ -16,9 +30,12 @@ import (
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	redisLiveKit "github.com/livekit/protocol/redis"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
@@ -44,22 +61,31 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		telemetry.NewTelemetryService,
 		getMessageBus,
 		NewIOInfoService,
+		wire.Bind(new(IOClient), new(*IOInfoService)),
 		rpc.NewEgressClient,
+		rpc.NewIngressClient,
 		getEgressStore,
 		NewEgressLauncher,
 		NewEgressService,
-		rpc.NewIngressClient,
 		getIngressStore,
 		getIngressConfig,
 		NewIngressService,
 		NewRoomAllocator,
 		NewRoomService,
 		NewRTCService,
+		NewAgentService,
+		rtc.NewAgentClient,
 		getSignalRelayConfig,
 		NewDefaultSignalServer,
 		routing.NewSignalClient,
+		getPSRPCConfig,
+		getPSRPCClientParams,
+		rpc.NewTopicFormatter,
+		rpc.NewTypedRoomClient,
+		rpc.NewTypedParticipantClient,
 		NewLocalRoomManager,
-		newTurnAuthHandler,
+		NewTURNAuthHandler,
+		getTURNAuthHandlerFunc,
 		newInProcessTurnServer,
 		utils.NewDefaultTimedVersionGenerator,
 		NewLivekitServer,
@@ -87,10 +113,11 @@ func getNodeID(currentNode routing.LocalNode) livekit.NodeID {
 func createKeyProvider(conf *config.Config) (auth.KeyProvider, error) {
 	// prefer keyfile if set
 	if conf.KeyFile != "" {
+		var otherFilter os.FileMode = 0007
 		if st, err := os.Stat(conf.KeyFile); err != nil {
 			return nil, err
-		} else if st.Mode().Perm() != 0600 {
-			return nil, fmt.Errorf("key file must have permission set to 600")
+		} else if st.Mode().Perm()&otherFilter != 0000 {
+			return nil, fmt.Errorf("key file others permissions must be set to 0")
 		}
 		f, err := os.Open(conf.KeyFile)
 		if err != nil {
@@ -178,6 +205,14 @@ func getRoomConf(config *config.Config) config.RoomConfig {
 
 func getSignalRelayConfig(config *config.Config) config.SignalRelayConfig {
 	return config.SignalRelay
+}
+
+func getPSRPCConfig(config *config.Config) rpc.PSRPCConfig {
+	return config.PSRPC
+}
+
+func getPSRPCClientParams(config rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+	return rpc.NewClientParams(config, bus, logger.GetLogger(), prometheus.PSRPCMetricsObserver{})
 }
 
 func newInProcessTurnServer(conf *config.Config, authHandler turn.AuthHandler) (*turn.Server, error) {
