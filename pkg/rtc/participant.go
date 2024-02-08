@@ -38,7 +38,7 @@ const (
 	sdBatchSize       = 30
 	rttUpdateInterval = 5 * time.Second
 
-	disconnectCleanupDuration = 15 * time.Second
+	disconnectCleanupDuration = 250 * time.Millisecond
 	migrationWaitDuration     = 3 * time.Second
 )
 
