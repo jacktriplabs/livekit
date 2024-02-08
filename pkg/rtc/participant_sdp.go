@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -46,14 +32,14 @@ func (p *ParticipantImpl) setCodecPreferencesOpusRedForPublisher(offer webrtc.Se
 		}
 
 		p.pendingTracksLock.RLock()
-		_, info, _ := p.getPendingTrack(streamID, livekit.TrackType_AUDIO)
+		_, info := p.getPendingTrack(streamID, livekit.TrackType_AUDIO)
 		// if RED is disabled for this track, don't prefer RED codec in offer
 		disableRed := info != nil && info.DisableRed
 		p.pendingTracksLock.RUnlock()
 
 		codecs, err := codecsFromMediaDescription(unmatchAudio)
 		if err != nil {
-			p.pubLogger.Errorw("extract codecs from media section failed", err, "media", unmatchAudio)
+			p.params.Logger.Errorw("extract codecs from media section failed", err, "media", unmatchAudio)
 			continue
 		}
 
@@ -104,7 +90,7 @@ func (p *ParticipantImpl) setCodecPreferencesOpusRedForPublisher(offer webrtc.Se
 
 	bytes, err := parsed.Marshal()
 	if err != nil {
-		p.pubLogger.Errorw("failed to marshal offer", err)
+		p.params.Logger.Errorw("failed to marshal offer", err)
 		return offer
 	}
 
@@ -132,7 +118,7 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 		if mt != nil {
 			info = mt.ToProto()
 		} else {
-			_, info, _ = p.getPendingTrack(streamID, livekit.TrackType_VIDEO)
+			_, info = p.getPendingTrack(streamID, livekit.TrackType_VIDEO)
 		}
 
 		if info == nil {
@@ -155,7 +141,7 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 		// remove dd extension if av1/vp9 not preferred
 		if !strings.Contains(strings.ToLower(mime), "av1") && !strings.Contains(strings.ToLower(mime), "vp9") {
 			for i, attr := range unmatchVideo.Attributes {
-				if strings.Contains(attr.Value, dd.ExtensionURI) {
+				if strings.Contains(attr.Value, dd.ExtensionUrl) {
 					unmatchVideo.Attributes[i] = unmatchVideo.Attributes[len(unmatchVideo.Attributes)-1]
 					unmatchVideo.Attributes = unmatchVideo.Attributes[:len(unmatchVideo.Attributes)-1]
 					break
@@ -166,7 +152,7 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 		if mime != "" {
 			codecs, err := codecsFromMediaDescription(unmatchVideo)
 			if err != nil {
-				p.pubLogger.Errorw("extract codecs from media section failed", err, "media", unmatchVideo)
+				p.params.Logger.Errorw("extract codecs from media section failed", err, "media", unmatchVideo)
 				continue
 			}
 
@@ -180,16 +166,13 @@ func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.Sess
 			}
 
 			unmatchVideo.MediaName.Formats = append(unmatchVideo.MediaName.Formats[:0], preferredCodecs...)
-			// if the client don't comply with codec order in SDP answer, only keep preferred codecs to force client to use it
-			if p.params.ClientInfo.ComplyWithCodecOrderInSDPAnswer() {
-				unmatchVideo.MediaName.Formats = append(unmatchVideo.MediaName.Formats, leftCodecs...)
-			}
+			unmatchVideo.MediaName.Formats = append(unmatchVideo.MediaName.Formats, leftCodecs...)
 		}
 	}
 
 	bytes, err := parsed.Marshal()
 	if err != nil {
-		p.pubLogger.Errorw("failed to marshal offer", err)
+		p.params.Logger.Errorw("failed to marshal offer", err)
 		return offer
 	}
 
@@ -239,7 +222,7 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 					track, _ := p.getPublishedTrackBySdpCid(streamID).(*MediaTrack)
 					if track == nil {
 						p.pendingTracksLock.RLock()
-						_, ti, _ = p.getPendingTrack(streamID, livekit.TrackType_AUDIO)
+						_, ti = p.getPendingTrack(streamID, livekit.TrackType_AUDIO)
 						p.pendingTracksLock.RUnlock()
 					} else {
 						ti = track.TrackInfo(false)
@@ -260,7 +243,7 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 
 			opusPT, err := parsed.GetPayloadTypeForCodec(sdp.Codec{Name: "opus"})
 			if err != nil {
-				p.pubLogger.Infow("failed to get opus payload type", "error", err, "trackID", ti.Sid)
+				p.params.Logger.Infow("failed to get opus payload type", "error", err, "trakcID", ti.Sid)
 				continue
 			}
 
@@ -286,7 +269,7 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 
 	bytes, err := parsed.Marshal()
 	if err != nil {
-		p.pubLogger.Infow("failed to marshal answer", "error", err)
+		p.params.Logger.Infow("failed to marshal answer", "error", err)
 		return answer
 	}
 	answer.SDP = string(bytes)

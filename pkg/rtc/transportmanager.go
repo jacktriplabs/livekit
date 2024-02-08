@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -49,25 +35,23 @@ const (
 )
 
 type TransportManagerParams struct {
-	Identity                     livekit.ParticipantIdentity
-	SID                          livekit.ParticipantID
-	SubscriberAsPrimary          bool
-	Config                       *WebRTCConfig
-	ProtocolVersion              types.ProtocolVersion
-	Telemetry                    telemetry.TelemetryService
-	CongestionControlConfig      config.CongestionControlConfig
-	EnabledSubscribeCodecs       []*livekit.Codec
-	EnabledPublishCodecs         []*livekit.Codec
-	SimTracks                    map[uint32]SimulcastTrackInfo
-	ClientInfo                   ClientInfo
-	Migration                    bool
-	AllowTCPFallback             bool
-	TCPFallbackRTTThreshold      int
-	AllowUDPUnstableFallback     bool
-	TURNSEnabled                 bool
-	AllowPlayoutDelay            bool
-	DataChannelMaxBufferedAmount uint64
-	Logger                       logger.Logger
+	Identity                 livekit.ParticipantIdentity
+	SID                      livekit.ParticipantID
+	SubscriberAsPrimary      bool
+	Config                   *WebRTCConfig
+	ProtocolVersion          types.ProtocolVersion
+	Telemetry                telemetry.TelemetryService
+	CongestionControlConfig  config.CongestionControlConfig
+	EnabledCodecs            []*livekit.Codec
+	SimTracks                map[uint32]SimulcastTrackInfo
+	ClientConf               *livekit.ClientConfiguration
+	ClientInfo               ClientInfo
+	Migration                bool
+	AllowTCPFallback         bool
+	TCPFallbackRTTThreshold  int
+	AllowUDPUnstableFallback bool
+	TURNSEnabled             bool
+	Logger                   logger.Logger
 }
 
 type TransportManager struct {
@@ -112,6 +96,35 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 	}
 	t.mediaLossProxy.OnMediaLossUpdate(t.onMediaLossUpdate)
 
+	subscribeCodecs := make([]*livekit.Codec, 0, len(params.EnabledCodecs))
+	publishCodecs := make([]*livekit.Codec, 0, len(params.EnabledCodecs))
+	shouldDisable := func(c *livekit.Codec, disabledCodecs []*livekit.Codec) bool {
+		for _, disableCodec := range disabledCodecs {
+			// disable codec's fmtp is empty means disable this codec entirely
+			if strings.EqualFold(c.Mime, disableCodec.Mime) && (disableCodec.FmtpLine == "" || disableCodec.FmtpLine == c.FmtpLine) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range params.EnabledCodecs {
+		var publishDisabled bool
+		var subscribeDisabled bool
+		if shouldDisable(c, params.ClientConf.GetDisabledCodecs().GetCodecs()) {
+			publishDisabled = true
+			subscribeDisabled = true
+		}
+		if shouldDisable(c, params.ClientConf.GetDisabledCodecs().GetPublish()) {
+			publishDisabled = true
+		}
+		if !publishDisabled {
+			publishCodecs = append(publishCodecs, c)
+		}
+		if !subscribeDisabled {
+			subscribeCodecs = append(subscribeCodecs, c)
+		}
+	}
+
 	publisher, err := NewPCTransport(TransportParams{
 		ParticipantID:           params.SID,
 		ParticipantIdentity:     params.Identity,
@@ -120,7 +133,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		DirectionConfig:         params.Config.Publisher,
 		CongestionControlConfig: params.CongestionControlConfig,
 		Telemetry:               params.Telemetry,
-		EnabledCodecs:           params.EnabledPublishCodecs,
+		EnabledCodecs:           publishCodecs,
 		Logger:                  LoggerWithPCTarget(params.Logger, livekit.SignalTarget_PUBLISHER),
 		SimTracks:               params.SimTracks,
 		ClientInfo:              params.ClientInfo,
@@ -145,20 +158,18 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 	})
 
 	subscriber, err := NewPCTransport(TransportParams{
-		ParticipantID:                params.SID,
-		ParticipantIdentity:          params.Identity,
-		ProtocolVersion:              params.ProtocolVersion,
-		Config:                       params.Config,
-		DirectionConfig:              params.Config.Subscriber,
-		CongestionControlConfig:      params.CongestionControlConfig,
-		Telemetry:                    params.Telemetry,
-		EnabledCodecs:                params.EnabledSubscribeCodecs,
-		Logger:                       LoggerWithPCTarget(params.Logger, livekit.SignalTarget_SUBSCRIBER),
-		ClientInfo:                   params.ClientInfo,
-		IsOfferer:                    true,
-		IsSendSide:                   true,
-		AllowPlayoutDelay:            params.AllowPlayoutDelay,
-		DataChannelMaxBufferedAmount: params.DataChannelMaxBufferedAmount,
+		ParticipantID:           params.SID,
+		ParticipantIdentity:     params.Identity,
+		ProtocolVersion:         params.ProtocolVersion,
+		Config:                  params.Config,
+		DirectionConfig:         params.Config.Subscriber,
+		CongestionControlConfig: params.CongestionControlConfig,
+		Telemetry:               params.Telemetry,
+		EnabledCodecs:           subscribeCodecs,
+		Logger:                  LoggerWithPCTarget(params.Logger, livekit.SignalTarget_SUBSCRIBER),
+		ClientInfo:              params.ClientInfo,
+		IsOfferer:               true,
+		IsSendSide:              true,
 	})
 	if err != nil {
 		return nil, err
@@ -496,12 +507,12 @@ func (t *TransportManager) HandleClientReconnect(reason livekit.ReconnectReason)
 	}
 }
 
-func (t *TransportManager) ICERestart(iceConfig *livekit.ICEConfig) error {
+func (t *TransportManager) ICERestart(iceConfig *livekit.ICEConfig) {
 	if iceConfig != nil {
 		t.SetICEConfig(iceConfig)
 	}
 
-	return t.subscriber.ICERestart()
+	t.subscriber.ICERestart()
 }
 
 func (t *TransportManager) OnICEConfigChanged(f func(iceConfig *livekit.ICEConfig)) {
@@ -580,7 +591,7 @@ func (t *TransportManager) handleConnectionFailed(isShortLived bool) {
 
 	lastSignalSince := time.Since(t.lastSignalAt)
 	signalValid := t.signalSourceValid.Load()
-	if !t.hasRecentSignalLocked() || !signalValid {
+	if lastSignalSince > iceFailedTimeout || !signalValid {
 		// the failed might cause by network interrupt because signal closed or we have not seen any signal in the time window,
 		// so don't switch to next candidate type
 		t.params.Logger.Infow("ignoring prefer candidate check by ICE failure because signal connection interrupted",
@@ -727,7 +738,7 @@ func (t *TransportManager) onMediaLossUpdate(loss uint8) {
 	if loss >= uint8(255*udpLossFracUnstable/100) {
 		t.udpLossUnstableCount |= 1
 		if bits.OnesCount32(t.udpLossUnstableCount) >= udpLossUnstableCountThreshold {
-			if t.udpRTT > 0 && t.signalingRTT < uint32(float32(t.udpRTT)*1.3) && int(t.signalingRTT) < t.params.TCPFallbackRTTThreshold && t.hasRecentSignalLocked() {
+			if t.udpRTT > 0 && t.signalingRTT < uint32(float32(t.udpRTT)*1.3) && int(t.signalingRTT) < t.params.TCPFallbackRTTThreshold && time.Since(t.lastSignalAt) < iceFailedTimeout {
 				t.udpLossUnstableCount = 0
 				t.lock.Unlock()
 
@@ -798,8 +809,4 @@ func (t *TransportManager) SetSubscriberAllowPause(allowPause bool) {
 
 func (t *TransportManager) SetSubscriberChannelCapacity(channelCapacity int64) {
 	t.subscriber.SetChannelCapacityOfStreamAllocator(channelCapacity)
-}
-
-func (t *TransportManager) hasRecentSignalLocked() bool {
-	return time.Since(t.lastSignalAt) < PingTimeoutSeconds*time.Second
 }

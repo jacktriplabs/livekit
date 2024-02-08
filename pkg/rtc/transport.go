@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -29,23 +15,19 @@ import (
 	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/rtcp"
-	"github.com/pion/sctp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
 
-	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/logger/pionlogger"
 	lksdp "github.com/livekit/protocol/sdp"
-	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
-	"github.com/livekit/livekit-server/pkg/sfu/rtpextension"
 	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
@@ -59,10 +41,9 @@ const (
 	negotiationFailedTimeout   = 15 * time.Second
 	dtlsRetransmissionInterval = 100 * time.Millisecond
 
-	iceDisconnectedTimeout = 10 * time.Second                          // compatible for ice-lite with firefox client
-	iceFailedTimeout       = 5 * time.Second                           // time between disconnected and failed
-	iceFailedTimeoutTotal  = iceFailedTimeout + iceDisconnectedTimeout // total time between connecting and failure
-	iceKeepaliveInterval   = 2 * time.Second                           // pion's default
+	iceDisconnectedTimeout = 10 * time.Second // compatible for ice-lite with firefox client
+	iceFailedTimeout       = 25 * time.Second // pion's default
+	iceKeepaliveInterval   = 2 * time.Second  // pion's default
 
 	minTcpICEConnectTimeout = 5 * time.Second
 	maxTcpICEConnectTimeout = 12 * time.Second // js-sdk has a default 15s timeout for first connection, let server detect failure earlier before that
@@ -70,20 +51,17 @@ const (
 	minConnectTimeoutAfterICE = 10 * time.Second
 	maxConnectTimeoutAfterICE = 20 * time.Second // max duration for waiting pc to connect after ICE is connected
 
-	maxICECandidates = 20
-
 	shortConnectionThreshold = 90 * time.Second
 )
 
 var (
-	ErrIceRestartWithoutLocalSDP        = errors.New("ICE restart without local SDP settled")
-	ErrIceRestartOnClosedPeerConnection = errors.New("ICE restart on closed peer connection")
-	ErrNoTransceiver                    = errors.New("no transceiver")
-	ErrNoSender                         = errors.New("no sender")
-	ErrNoICECandidateHandler            = errors.New("no ICE candidate handler")
-	ErrNoOfferHandler                   = errors.New("no offer handler")
-	ErrNoAnswerHandler                  = errors.New("no answer handler")
-	ErrMidNotFound                      = errors.New("mid not found")
+	ErrIceRestartWithoutLocalSDP = errors.New("ICE restart without local SDP settled")
+	ErrNoTransceiver             = errors.New("no transceiver")
+	ErrNoSender                  = errors.New("no sender")
+	ErrNoICECandidateHandler     = errors.New("no ICE candidate handler")
+	ErrNoOfferHandler            = errors.New("no offer handler")
+	ErrNoAnswerHandler           = errors.New("no answer handler")
+	ErrMidNotFound               = errors.New("mid not found")
 )
 
 // -------------------------------------------------------------------------
@@ -235,41 +213,30 @@ type PCTransport struct {
 	pendingRestartIceOffer    *webrtc.SessionDescription
 
 	// for cleaner logging
-	allowedLocalCandidates   *utils.DedupedSlice[string]
-	allowedRemoteCandidates  *utils.DedupedSlice[string]
-	filteredLocalCandidates  *utils.DedupedSlice[string]
-	filteredRemoteCandidates *utils.DedupedSlice[string]
+	allowedLocalCandidates   []string
+	allowedRemoteCandidates  []string
+	filteredLocalCandidates  []string
+	filteredRemoteCandidates []string
 }
 
 type TransportParams struct {
-	ParticipantID                livekit.ParticipantID
-	ParticipantIdentity          livekit.ParticipantIdentity
-	ProtocolVersion              types.ProtocolVersion
-	Config                       *WebRTCConfig
-	DirectionConfig              DirectionConfig
-	CongestionControlConfig      config.CongestionControlConfig
-	Telemetry                    telemetry.TelemetryService
-	EnabledCodecs                []*livekit.Codec
-	Logger                       logger.Logger
-	SimTracks                    map[uint32]SimulcastTrackInfo
-	ClientInfo                   ClientInfo
-	IsOfferer                    bool
-	IsSendSide                   bool
-	AllowPlayoutDelay            bool
-	DataChannelMaxBufferedAmount uint64
+	ParticipantID           livekit.ParticipantID
+	ParticipantIdentity     livekit.ParticipantIdentity
+	ProtocolVersion         types.ProtocolVersion
+	Config                  *WebRTCConfig
+	DirectionConfig         DirectionConfig
+	CongestionControlConfig config.CongestionControlConfig
+	Telemetry               telemetry.TelemetryService
+	EnabledCodecs           []*livekit.Codec
+	Logger                  logger.Logger
+	SimTracks               map[uint32]SimulcastTrackInfo
+	ClientInfo              ClientInfo
+	IsOfferer               bool
+	IsSendSide              bool
 }
 
 func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimator cc.BandwidthEstimator)) (*webrtc.PeerConnection, *webrtc.MediaEngine, error) {
-	directionConfig := params.DirectionConfig
-
-	if params.AllowPlayoutDelay {
-		directionConfig.RTPHeaderExtension.Video = append(directionConfig.RTPHeaderExtension.Video, rtpextension.PlayoutDelayURI)
-	}
-
-	// Some of the browser clients do not handle H.264 High Profile in signalling properly.
-	// They still decode if the actual stream is H.264 High Profile, but do not handle it well in signalling.
-	// So, disable H.264 High Profile for SUBSCRIBER peer connection to ensure it is not offered.
-	me, err := createMediaEngine(params.EnabledCodecs, directionConfig, params.IsOfferer)
+	me, err := createMediaEngine(params.EnabledCodecs, params.DirectionConfig)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -322,9 +289,6 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 			params.Logger.Infow("client doesn't support prflx over relay, use external ip only as host candidate", "ips", nat1to1Ips)
 			se.SetNAT1To1IPs(nat1to1Ips, webrtc.ICECandidateTypeHost)
 			se.SetIPFilter(func(ip net.IP) bool {
-				if ip.To4() == nil {
-					return true
-				}
 				ipstr := ip.String()
 				for _, inc := range includeIps {
 					if inc == ipstr {
@@ -393,15 +357,11 @@ func NewPCTransport(params TransportParams) (*PCTransport, error) {
 		eventCh:                  make(chan event, 50),
 		previousTrackDescription: make(map[string]*trackDescription),
 		canReuseTransceiver:      true,
-		allowedLocalCandidates:   utils.NewDedupedSlice[string](maxICECandidates),
-		allowedRemoteCandidates:  utils.NewDedupedSlice[string](maxICECandidates),
-		filteredLocalCandidates:  utils.NewDedupedSlice[string](maxICECandidates),
-		filteredRemoteCandidates: utils.NewDedupedSlice[string](maxICECandidates),
 	}
 	if params.IsSendSide {
 		t.streamAllocator = streamallocator.NewStreamAllocator(streamallocator.StreamAllocatorParams{
 			Config: params.CongestionControlConfig,
-			Logger: params.Logger.WithComponent(sutils.ComponentCongestionControl),
+			Logger: params.Logger,
 		})
 		t.streamAllocator.Start()
 		t.pacer = pacer.NewPassThrough(params.Logger)
@@ -637,11 +597,6 @@ func (t *PCTransport) onICEConnectionStateChange(state webrtc.ICEConnectionState
 
 	case webrtc.ICEConnectionStateChecking:
 		t.setICEStartedAt(time.Now())
-
-	case webrtc.ICEConnectionStateDisconnected:
-		fallthrough
-	case webrtc.ICEConnectionStateFailed:
-		t.params.Logger.Infow("ice connection state change unexpected", "state", state.String())
 	}
 }
 
@@ -668,9 +623,9 @@ func (t *PCTransport) onPeerConnectionStateChange(state webrtc.PeerConnectionSta
 }
 
 func (t *PCTransport) onDataChannel(dc *webrtc.DataChannel) {
-	t.params.Logger.Debugw(dc.Label() + " data channel open")
 	switch dc.Label() {
 	case ReliableDataChannel:
+		t.params.Logger.Debugw("reliable data channel open")
 		t.lock.Lock()
 		t.reliableDC = dc
 		t.reliableDCOpened = true
@@ -683,6 +638,7 @@ func (t *PCTransport) onDataChannel(dc *webrtc.DataChannel) {
 
 		t.maybeNotifyFullyEstablished()
 	case LossyDataChannel:
+		t.params.Logger.Debugw("lossy data channel open")
 		t.lock.Lock()
 		t.lossyDC = dc
 		t.lossyDCOpened = true
@@ -709,9 +665,9 @@ func (t *PCTransport) maybeNotifyFullyEstablished() {
 
 func (t *PCTransport) isFullyEstablished() bool {
 	t.lock.RLock()
-	defer t.lock.RUnlock()
-
-	return t.reliableDCOpened && t.lossyDCOpened && !t.connectedAt.IsZero()
+	fullyEstablished := t.reliableDCOpened && t.lossyDCOpened && !t.connectedAt.IsZero()
+	t.lock.RUnlock()
+	return fullyEstablished
 }
 
 func (t *PCTransport) SetPreferTCP(preferTCP bool) {
@@ -767,6 +723,7 @@ func (t *PCTransport) AddTrack(trackLocal webrtc.TrackLocal, params types.AddTra
 	}
 
 	configureAudioTransceiver(transceiver, params.Stereo, !params.Red || !t.params.ClientInfo.SupportsAudioRED())
+
 	return
 }
 
@@ -817,29 +774,22 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 		return err
 	}
 
-	dcReadyHandler := func() {
+	reliableDCReadyHandler := func() {
+		t.params.Logger.Debugw("reliable data channel open")
 		t.lock.Lock()
-		switch dc.Label() {
-		case ReliableDataChannel:
-			t.reliableDCOpened = true
-
-		case LossyDataChannel:
-			t.lossyDCOpened = true
-		}
+		t.reliableDCOpened = true
 		t.lock.Unlock()
-		t.params.Logger.Debugw(dc.Label() + " data channel open")
 
 		t.maybeNotifyFullyEstablished()
 	}
 
-	dcCloseHandler := func() {
-		t.params.Logger.Debugw(dc.Label() + " data channel close")
-	}
+	lossyDCReadyHanlder := func() {
+		t.params.Logger.Debugw("lossy data channel open")
+		t.lock.Lock()
+		t.lossyDCOpened = true
+		t.lock.Unlock()
 
-	dcErrorHandler := func(err error) {
-		if !errors.Is(err, sctp.ErrResetPacketInStateNotExist) && !errors.Is(err, sctp.ErrChunk) {
-			t.params.Logger.Errorw(dc.Label()+" data channel error", err)
-		}
+		t.maybeNotifyFullyEstablished()
 	}
 
 	t.lock.Lock()
@@ -847,21 +797,17 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 	case ReliableDataChannel:
 		t.reliableDC = dc
 		if t.params.DirectionConfig.StrictACKs {
-			t.reliableDC.OnOpen(dcReadyHandler)
+			t.reliableDC.OnOpen(reliableDCReadyHandler)
 		} else {
-			t.reliableDC.OnDial(dcReadyHandler)
+			t.reliableDC.OnDial(reliableDCReadyHandler)
 		}
-		t.reliableDC.OnClose(dcCloseHandler)
-		t.reliableDC.OnError(dcErrorHandler)
 	case LossyDataChannel:
 		t.lossyDC = dc
 		if t.params.DirectionConfig.StrictACKs {
-			t.lossyDC.OnOpen(dcReadyHandler)
+			t.lossyDC.OnOpen(lossyDCReadyHanlder)
 		} else {
-			t.lossyDC.OnDial(dcReadyHandler)
+			t.lossyDC.OnDial(lossyDCReadyHanlder)
 		}
-		t.lossyDC.OnClose(dcCloseHandler)
-		t.lossyDC.OnError(dcErrorHandler)
 	default:
 		t.params.Logger.Errorw("unknown data channel label", nil, "label", dc.Label())
 	}
@@ -928,14 +874,6 @@ func (t *PCTransport) SendDataPacket(dp *livekit.DataPacket, data []byte) error 
 
 	if dc == nil {
 		return ErrDataChannelUnavailable
-	}
-
-	if t.pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
-		return ErrTransportFailure
-	}
-
-	if t.params.DataChannelMaxBufferedAmount > 0 && dc.BufferedAmount() > t.params.DataChannelMaxBufferedAmount {
-		return ErrDataChannelBufferFull
 	}
 
 	return dc.Send(data)
@@ -1139,16 +1077,10 @@ func (t *PCTransport) Negotiate(force bool) {
 	}
 }
 
-func (t *PCTransport) ICERestart() error {
-	if t.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
-		t.params.Logger.Warnw("trying to restart ICE on closed peer connection", nil)
-		return ErrIceRestartOnClosedPeerConnection
-	}
-
+func (t *PCTransport) ICERestart() {
 	t.postEvent(event{
 		signal: signalICERestart,
 	})
-	return nil
 }
 
 func (t *PCTransport) ResetShortConnOnICERestart() {
@@ -1216,7 +1148,7 @@ func (t *PCTransport) GetICEConnectionType() types.ICEConnectionType {
 		// Pion would have created a prflx candidate with the same address as the relay candidate.
 		// to report an accurate connection type, we'll compare to see if existing relay candidates match
 		t.lock.RLock()
-		allowedRemoteCandidates := t.allowedRemoteCandidates.Get()
+		allowedRemoteCandidates := t.allowedRemoteCandidates
 		t.lock.RUnlock()
 
 		for _, ci := range allowedRemoteCandidates {
@@ -1452,7 +1384,6 @@ func (t *PCTransport) processEvents() {
 
 	t.clearSignalStateCheckTimer()
 	t.params.Logger.Debugw("leaving events processor")
-	t.handleLogICECandidates(nil)
 }
 
 func (t *PCTransport) handleEvent(e *event) error {
@@ -1537,12 +1468,12 @@ func (t *PCTransport) clearLocalDescriptionSent() {
 	t.cacheLocalCandidates = true
 	t.cachedLocalCandidates = nil
 
-	t.allowedLocalCandidates.Clear()
+	t.allowedLocalCandidates = nil
 	t.lock.Lock()
-	t.allowedRemoteCandidates.Clear()
+	t.allowedRemoteCandidates = nil
 	t.lock.Unlock()
-	t.filteredLocalCandidates.Clear()
-	t.filteredRemoteCandidates.Clear()
+	t.filteredLocalCandidates = nil
+	t.filteredRemoteCandidates = nil
 }
 
 func (t *PCTransport) handleLocalICECandidate(e *event) error {
@@ -1552,7 +1483,7 @@ func (t *PCTransport) handleLocalICECandidate(e *event) error {
 	if t.preferTCP.Load() && c != nil && c.Protocol != webrtc.ICEProtocolTCP {
 		cstr := c.String()
 		t.params.Logger.Debugw("filtering out local candidate", "candidate", cstr)
-		t.filteredLocalCandidates.Add(cstr)
+		t.filteredLocalCandidates = append(t.filteredLocalCandidates, cstr)
 		filtered = true
 	}
 
@@ -1561,7 +1492,7 @@ func (t *PCTransport) handleLocalICECandidate(e *event) error {
 	}
 
 	if c != nil {
-		t.allowedLocalCandidates.Add(c.String())
+		t.allowedLocalCandidates = append(t.allowedLocalCandidates, c.String())
 	}
 	if t.cacheLocalCandidates {
 		t.cachedLocalCandidates = append(t.cachedLocalCandidates, c)
@@ -1581,7 +1512,7 @@ func (t *PCTransport) handleRemoteICECandidate(e *event) error {
 	filtered := false
 	if t.preferTCP.Load() && !strings.Contains(c.Candidate, "tcp") {
 		t.params.Logger.Debugw("filtering out remote candidate", "candidate", c.Candidate)
-		t.filteredRemoteCandidates.Add(c.Candidate)
+		t.filteredRemoteCandidates = append(t.filteredRemoteCandidates, c.Candidate)
 		filtered = true
 	}
 
@@ -1590,7 +1521,7 @@ func (t *PCTransport) handleRemoteICECandidate(e *event) error {
 	}
 
 	t.lock.Lock()
-	t.allowedRemoteCandidates.Add(c.Candidate)
+	t.allowedRemoteCandidates = append(t.allowedRemoteCandidates, c.Candidate)
 	t.lock.Unlock()
 
 	if t.pc.RemoteDescription() == nil {
@@ -1608,10 +1539,10 @@ func (t *PCTransport) handleRemoteICECandidate(e *event) error {
 func (t *PCTransport) handleLogICECandidates(e *event) error {
 	t.params.Logger.Infow(
 		"ice candidates",
-		"lc", t.allowedLocalCandidates.Get(),
-		"rc", t.allowedRemoteCandidates.Get(),
-		"lc (filtered)", t.filteredLocalCandidates.Get(),
-		"rc (filtered)", t.filteredRemoteCandidates.Get(),
+		"lc", t.allowedLocalCandidates,
+		"rc", t.allowedRemoteCandidates,
+		"lc (filtered)", t.filteredLocalCandidates,
+		"rc (filtered)", t.filteredRemoteCandidates,
 	)
 
 	return nil

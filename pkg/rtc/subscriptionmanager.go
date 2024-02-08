@@ -36,9 +36,9 @@ var (
 	reconcileInterval = 3 * time.Second
 	// amount of time to give up if a track or publisher isn't found
 	// ensuring this is longer than iceFailedTimeout so we are certain the participant won't return
-	notFoundTimeout = time.Minute
+	notFoundTimeout = iceFailedTimeout
 	// amount of time to try otherwise before flagging subscription as failed
-	subscriptionTimeout    = iceFailedTimeoutTotal
+	subscriptionTimeout    = iceFailedTimeout
 	trackRemoveGracePeriod = time.Second
 	maxUnsubscribeWait     = time.Second
 )
@@ -148,7 +148,7 @@ func (m *SubscriptionManager) SubscribeToTrack(trackID livekit.TrackID) {
 		sub, desireChanged = m.setDesired(trackID, true)
 	}
 	if desireChanged {
-		sub.logger.Debugw("subscribing to track")
+		sub.logger.Infow("subscribing to track")
 	}
 
 	// always reconcile, since SubscribeToTrack could be called when the track is ready
@@ -161,7 +161,7 @@ func (m *SubscriptionManager) UnsubscribeFromTrack(trackID livekit.TrackID) {
 		return
 	}
 
-	sub.logger.Debugw("unsubscribing from track")
+	sub.logger.Infow("unsubscribing from track")
 	m.queueReconcile(trackID)
 }
 

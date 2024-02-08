@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package service
 
 import (
@@ -70,7 +56,7 @@ type RedisStore struct {
 func NewRedisStore(rc redis.UniversalClient) *RedisStore {
 	unlockScript := `if redis.call("get", KEYS[1]) == ARGV[1] then
 						return redis.call("del", KEYS[1])
-					 else return 0
+					 else return 0 
 					 end`
 
 	return &RedisStore{
@@ -194,7 +180,7 @@ func (s *RedisStore) ListRooms(_ context.Context, roomNames []livekit.RoomName) 
 			return nil, errors.Wrap(err, "could not get rooms")
 		}
 	} else {
-		names := livekit.IDsAsStrings(roomNames)
+		names := livekit.RoomNamesAsStrings(roomNames)
 		var results []interface{}
 		results, err = s.rc.HMGet(s.ctx, RoomsKey, names...).Result()
 		if err != nil && err != redis.Nil {
@@ -514,7 +500,7 @@ func (s *RedisStore) storeIngress(_ context.Context, info *livekit.IngressInfo) 
 	if info.IngressId == "" {
 		return errors.New("Missing IngressId")
 	}
-	if info.StreamKey == "" && info.InputType != livekit.IngressInput_URL_INPUT {
+	if info.StreamKey == "" {
 		return errors.New("Missing StreamKey")
 	}
 
@@ -543,9 +529,7 @@ func (s *RedisStore) storeIngress(_ context.Context, info *livekit.IngressInfo) 
 
 		results, err := tx.TxPipelined(s.ctx, func(p redis.Pipeliner) error {
 			p.HSet(s.ctx, IngressKey, info.IngressId, data)
-			if info.StreamKey != "" {
-				p.HSet(s.ctx, StreamKeyKey, info.StreamKey, info.IngressId)
-			}
+			p.HSet(s.ctx, StreamKeyKey, info.StreamKey, info.IngressId)
 
 			if oldRoom != info.RoomName {
 				if oldRoom != "" {
@@ -801,9 +785,7 @@ func (s *RedisStore) UpdateIngressState(ctx context.Context, ingressId string, s
 func (s *RedisStore) DeleteIngress(_ context.Context, info *livekit.IngressInfo) error {
 	tx := s.rc.TxPipeline()
 	tx.SRem(s.ctx, RoomIngressPrefix+info.RoomName, info.IngressId)
-	if info.StreamKey != "" {
-		tx.HDel(s.ctx, StreamKeyKey, info.StreamKey)
-	}
+	tx.HDel(s.ctx, StreamKeyKey, info.IngressId)
 	tx.HDel(s.ctx, IngressKey, info.IngressId)
 	tx.Del(s.ctx, IngressStatePrefix+info.IngressId)
 	if _, err := tx.Exec(s.ctx); err != nil {

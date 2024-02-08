@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package buffer
 
 import (
@@ -19,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/livekit/protocol/logger"
-	"github.com/pion/rtp/codecs"
 )
 
 var (
@@ -52,7 +37,7 @@ type VP8 struct {
 
 	I         bool
 	M         bool
-	PictureID uint16 /* 7 or 15 bits, picture ID */
+	PictureID uint16 /* 8 or 16 bits, picture ID */
 
 	L         bool
 	TL0PICIDX uint8 /* 8 bits temporal level zero index */
@@ -311,28 +296,55 @@ func IsH264KeyFrame(payload []byte) bool {
 
 // -------------------------------------
 
-// IsVP9KeyFrame detects if vp9 payload is a keyframe
-// taken from https://github.com/jech/galene/blob/master/codecs/codecs.go
-// all credits belongs to Juliusz Chroboczek @jech and the awesome Galene SFU
 func IsVP9KeyFrame(payload []byte) bool {
-	var vp9 codecs.VP9Packet
-	_, err := vp9.Unmarshal(payload)
-	if err != nil || len(vp9.Payload) < 1 {
-		return false
-	}
-	if !vp9.B {
+	payloadLen := len(payload)
+	if payloadLen < 1 {
 		return false
 	}
 
-	if (vp9.Payload[0] & 0xc0) != 0x80 {
+	idx := 0
+	I := payload[idx]&0x80 > 0
+	P := payload[idx]&0x40 > 0
+	L := payload[idx]&0x20 > 0
+	F := payload[idx]&0x10 > 0
+	B := payload[idx]&0x08 > 0
+
+	if F && !I {
 		return false
 	}
 
-	profile := (vp9.Payload[0] >> 4) & 0x3
-	if profile != 3 {
-		return (vp9.Payload[0] & 0xC) == 0
+	// Check for PictureID
+	if I {
+		idx++
+		if payloadLen < idx+1 {
+			return false
+		}
+		// Check if m is 1, then Picture ID is 15 bits
+		if payload[idx]&0x80 > 0 {
+			idx++
+			if payloadLen < idx+1 {
+				return false
+			}
+		}
 	}
-	return (vp9.Payload[0] & 0x6) == 0
+
+	// Check if TL0PICIDX is present
+	sid := -1
+	if L {
+		idx++
+		if payloadLen < idx+1 {
+			return false
+		}
+
+		tid := (payload[idx] >> 5) & 0x7
+		if !P && tid != 0 {
+			return false
+		}
+
+		sid = int((payload[idx] >> 1) & 0x7)
+	}
+
+	return !P && (!L || (L && sid == 0)) && B
 }
 
 // -------------------------------------

@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -24,6 +10,7 @@ import (
 
 	"github.com/livekit/livekit-server/version"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/webhook"
 
 	"github.com/livekit/livekit-server/pkg/config"
@@ -42,7 +29,9 @@ const (
 )
 
 func init() {
-	config.InitLoggerFromConfig(&config.DefaultConfig.Logging)
+	config.InitLoggerFromConfig(config.LoggingConfig{
+		Config: logger.Config{Level: "debug"},
+	})
 	// allow immediate closure in testing
 	RoomDepartureGrace = 1
 	roomUpdateInterval = defaultDelay
@@ -83,7 +72,7 @@ func TestJoinedState(t *testing.T) {
 func TestRoomJoin(t *testing.T) {
 	t.Run("joining returns existing participant data", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: numParticipants})
-		pNew := NewMockParticipant("new", types.CurrentProtocol, false, false)
+		pNew := newMockParticipant("new", types.CurrentProtocol, false, false)
 
 		_ = rm.Join(pNew, nil, nil, iceServersForRoom)
 
@@ -98,7 +87,7 @@ func TestRoomJoin(t *testing.T) {
 	t.Run("subscribe to existing channels upon join", func(t *testing.T) {
 		numExisting := 3
 		rm := newRoomWithParticipants(t, testRoomOpts{num: numExisting})
-		p := NewMockParticipant("new", types.CurrentProtocol, false, false)
+		p := newMockParticipant("new", types.CurrentProtocol, false, false)
 
 		err := rm.Join(p, nil, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
 		require.NoError(t, err)
@@ -154,7 +143,7 @@ func TestRoomJoin(t *testing.T) {
 		rm.lock.Lock()
 		rm.protoRoom.MaxParticipants = 1
 		rm.lock.Unlock()
-		p := NewMockParticipant("second", types.ProtocolVersion(0), false, false)
+		p := newMockParticipant("second", types.ProtocolVersion(0), false, false)
 
 		err := rm.Join(p, nil, nil, iceServersForRoom)
 		require.Equal(t, ErrMaxParticipantsExceeded, err)
@@ -414,7 +403,7 @@ func TestNewTrack(t *testing.T) {
 		pub := participants[2].(*typesfakes.FakeLocalParticipant)
 
 		// pub adds track
-		track := NewMockTrack(livekit.TrackType_VIDEO, "webcam")
+		track := newMockTrack(livekit.TrackType_VIDEO, "webcam")
 		trackCB := pub.OnTrackPublishedArgsForCall(0)
 		require.NotNil(t, trackCB)
 		trackCB(pub, track)
@@ -653,7 +642,7 @@ func TestHiddenParticipants(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, numHidden: 1})
 		defer rm.Close()
 
-		pNew := NewMockParticipant("new", types.CurrentProtocol, false, false)
+		pNew := newMockParticipant("new", types.CurrentProtocol, false, false)
 		rm.Join(pNew, nil, nil, iceServersForRoom)
 
 		// expect new participant to get a JoinReply
@@ -667,7 +656,7 @@ func TestHiddenParticipants(t *testing.T) {
 
 	t.Run("hidden participant subscribes to tracks", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
-		hidden := NewMockParticipant("hidden", types.CurrentProtocol, true, false)
+		hidden := newMockParticipant("hidden", types.CurrentProtocol, true, false)
 
 		err := rm.Join(hidden, nil, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
 		require.NoError(t, err)
@@ -689,7 +678,7 @@ func TestRoomUpdate(t *testing.T) {
 		p1 := rm.GetParticipants()[0].(*typesfakes.FakeLocalParticipant)
 		require.Equal(t, 0, p1.SendRoomUpdateCallCount())
 
-		p2 := NewMockParticipant("p2", types.CurrentProtocol, false, false)
+		p2 := newMockParticipant("p2", types.CurrentProtocol, false, false)
 		require.NoError(t, rm.Join(p2, nil, nil, iceServersForRoom))
 
 		// p1 should have received an update
@@ -739,11 +728,11 @@ func newRoomWithParticipants(t *testing.T, opts testRoomOpts) *Room {
 			Region:   "testregion",
 		},
 		telemetry.NewTelemetryService(webhook.NewDefaultNotifier("", "", nil), &telemetryfakes.FakeAnalyticsService{}),
-		nil, nil,
+		nil,
 	)
 	for i := 0; i < opts.num+opts.numHidden; i++ {
 		identity := livekit.ParticipantIdentity(fmt.Sprintf("p%d", i))
-		participant := NewMockParticipant(identity, opts.protocol, i >= opts.num, true)
+		participant := newMockParticipant(identity, opts.protocol, i >= opts.num, true)
 		err := rm.Join(participant, nil, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
 		require.NoError(t, err)
 		participant.StateReturns(livekit.ParticipantInfo_ACTIVE)
