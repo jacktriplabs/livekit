@@ -43,10 +43,10 @@ rtc:
   # that maps to an external one
   use_external_ip: true
   # # when set, LiveKit will attempt to use a UDP mux so all UDP traffic goes through
-  # # listed port(s). To maximize system performance, we recommend using a range of ports
-  # # greater or equal to the number of vCPUs on the machine.
+  # # a single port. This simplifies deployment, but mux will become an overhead for
+  # # highly trafficked deployments.
   # # port_range_start & end must not be set for this config to take effect
-  # udp_port: 7882-7892
+  # udp_port: 7882
   # # when set to true, server will use a lite ice agent, that will speed up ice connection, but
   # # might cause connect issue if server running behind NAT.
   # use_ice_lite: true
@@ -107,14 +107,6 @@ rtc:
   # # are disabled and clients don't ACK opened peer connections, only reliable, ordered delivery
   # # will be available.
   # strict_acks: true
-  # # enable batch write to merge network write system calls to reduce cpu usage. Outgoing packets
-  # # will be queued until length of queue equal to `batch_size` or time elapsed since last write exceeds `max_flush_interval`.
-  # batch_io:
-  #    batch_size: 128
-  #    max_flush_interval: 2ms
-  # # max number of bytes to buffer for data channel. 0 means unlimited.
-  # # when this limit is breached, data messages will be dropped till the buffered amount drops below this limit.
-  # data_channel_max_buffered_amount: 0
 
 # when enabled, LiveKit will expose prometheus metrics on :6789/metrics
 # prometheus_port: 6789
@@ -151,7 +143,7 @@ keys:
 #   max_participants: 0
 #   # only accept specific codecs for clients publishing to this room
 #   # this is useful to standardize codecs across clients
-#   # other supported codecs are video/h264, video/vp9, video/av1, audio/red
+#   # other supported codecs are video/h264
 #   enabled_codecs:
 #     - mime: audio/opus
 #     - mime: video/vp8
@@ -160,14 +152,6 @@ keys:
 #   enable_remote_unmute: true
 #   # limit size of room and participant's metadata, 0 for no limit
 #   max_metadata_size: 0
-#   # control playout delay in ms of video track (and associated audio track)
-#   playout_delay:
-#     enabled: true
-#     min: 100
-#     max: 2000
-#   # improves A/V sync when playout_delay set to a value larger than 200ms. It will disables transceiver re-use
-#   # so not recommended for rooms with frequent subscription changes
-#   sync_streams: true
 
 # Webhooks
 # when configured, LiveKit notifies your URL handler with room events
@@ -183,7 +167,7 @@ keys:
 # since v1.4.0, a more reliable, psrpc based signal relay is available
 # this gives us the ability to reliably proxy messages between a signal server and RTC node
 # signal_relay:
-#   # enabled by default as of v1.5.0, legacy signal proxy will be removed in v1.6
+#   # disabled by default. will be enabled by default in future versions
 #   enabled: true
 #   # amount of time a message delivery is tried before giving up
 #   retry_timeout: 30s
@@ -195,20 +179,6 @@ keys:
 #   max_retry_interval: 5s
 #   # number of messages to buffer before dropping
 #   stream_buffer_size: 1000
-
-# PSRPC
-# since v1.5.1, a more reliable, psrpc based internal rpc
-# psrpc:
-#   # enable the psrpc internal api client for roomservice calls
-#   enabled: true
-#   # maximum number of rpc attempts
-#   max_attempts: 3
-#   # initial time to wait for calls to complete
-#   timeout: 500ms
-#   # amount of time added to the timeout after each failure
-#   backoff: 500ms
-#   # number of messages to buffer before dropping
-#   buffer_size: 1000
 
 # customize audio level sensitivity
 # audio:
@@ -242,7 +212,7 @@ keys:
 #   # set UDP port range for TURN relay to connect to LiveKit SFU, by default it uses a any available port
 #   relay_range_start: 1024
 #   relay_range_end: 30000
-#   # set external_tls to true if using a L4 load balancer to terminate TLS. when enabled,
+#   # set external_tl to true if using a L4 load balancer to terminate TLS. when enabled,
 #   # LiveKit expects unencrypted traffic on tls_port, and still advertise tls_port as a TURN/TLS candidate.
 #   external_tls: true
 #   # needs to match tls cert domain

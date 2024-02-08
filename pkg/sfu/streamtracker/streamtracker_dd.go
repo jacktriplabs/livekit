@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package streamtracker
 
 import (
@@ -192,10 +178,6 @@ func (s *StreamTrackerDependencyDescriptor) Observe(temporalLayer int32, pktSize
 	dtis := ddVal.Descriptor.FrameDependencies.DecodeTargetIndications
 
 	for _, dt := range ddVal.DecodeTargets {
-		if len(dtis) <= dt.Target {
-			s.params.Logger.Errorw("len(dtis) less than target", nil, "target", dt.Target, "dtis", dtis)
-			continue
-		}
 		// we are not dropping discardable frames now, so only ingore not present frames
 		if dtis[dt.Target] == dd.DecodeTargetNotPresent {
 			continue

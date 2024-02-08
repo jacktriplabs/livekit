@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package streamallocator
 
 import (
@@ -56,7 +42,7 @@ type Track struct {
 
 	isDirty bool
 
-	streamState StreamState
+	isPaused bool
 }
 
 func NewTrack(
@@ -75,7 +61,7 @@ func NewTrack(
 		nackInfos:             make(map[uint16]sfu.NackInfo),
 		nackHistory:           make([]string, 0, 10),
 		receiverReportHistory: make([]string, 0, 10),
-		streamState:           StreamStateInactive,
+		isPaused:              true,
 	}
 	t.SetPriority(0)
 	t.SetMaxLayer(downTrack.MaxLayer())
@@ -92,17 +78,13 @@ func (t *Track) SetDirty(isDirty bool) bool {
 	return true
 }
 
-func (t *Track) SetStreamState(streamState StreamState) bool {
-	if t.streamState == streamState {
+func (t *Track) SetPaused(isPaused bool) bool {
+	if t.isPaused == isPaused {
 		return false
 	}
 
-	t.streamState = streamState
+	t.isPaused = isPaused
 	return true
-}
-
-func (t *Track) IsSubscribeMutable() bool {
-	return t.streamState != StreamStatePaused
 }
 
 func (t *Track) SetPriority(priority uint8) bool {
@@ -164,11 +146,7 @@ func (t *Track) ProvisionalAllocatePrepare() {
 	t.downTrack.ProvisionalAllocatePrepare()
 }
 
-func (t *Track) ProvisionalAllocateReset() {
-	t.downTrack.ProvisionalAllocateReset()
-}
-
-func (t *Track) ProvisionalAllocate(availableChannelCapacity int64, layer buffer.VideoLayer, allowPause bool, allowOvershoot bool) (bool, int64) {
+func (t *Track) ProvisionalAllocate(availableChannelCapacity int64, layer buffer.VideoLayer, allowPause bool, allowOvershoot bool) int64 {
 	return t.downTrack.ProvisionalAllocate(availableChannelCapacity, layer, allowPause, allowOvershoot)
 }
 

@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -160,8 +146,8 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 			u.params.Logger.Debugw(
 				"skipping older subscription permission version",
 				"existingValue", perms,
-				"existingVersion", u.subscriptionPermissionVersion.String(),
-				"requestingValue", logger.Proto(subscriptionPermission),
+				"existingVersion", u.subscriptionPermissionVersion.ToProto().String(),
+				"requestingValue", subscriptionPermission.String(),
 				"requestingVersion", timedVersion.String(),
 			)
 			u.lock.Unlock()
@@ -178,7 +164,7 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 	if subscriptionPermission == nil {
 		u.params.Logger.Debugw(
 			"updating subscription permission, setting to nil",
-			"version", u.subscriptionPermissionVersion.String(),
+			"version", u.subscriptionPermissionVersion.ToProto().String(),
 		)
 		// possible to get a nil when migrating
 		u.lock.Unlock()
@@ -187,8 +173,8 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 
 	u.params.Logger.Debugw(
 		"updating subscription permission",
-		"permissions", logger.Proto(u.subscriptionPermission),
-		"version", u.subscriptionPermissionVersion.String(),
+		"permissions", u.subscriptionPermission.String(),
+		"version", u.subscriptionPermissionVersion.ToProto().String(),
 	)
 	if err := u.parseSubscriptionPermissionsLocked(subscriptionPermission, func(pID livekit.ParticipantID) types.LocalParticipant {
 		u.lock.Unlock()
@@ -247,7 +233,7 @@ func (u *UpTrackManager) AddPublishedTrack(track types.MediaTrack) {
 		u.publishedTracks[track.ID()] = track
 	}
 	u.lock.Unlock()
-	u.params.Logger.Debugw("added published track", "trackID", track.ID(), "trackInfo", logger.Proto(track.ToProto()))
+	u.params.Logger.Debugw("added published track", "trackID", track.ID(), "trackInfo", track.ToProto().String())
 
 	track.AddOnClose(func() {
 		notifyClose := false
@@ -417,20 +403,4 @@ func (u *UpTrackManager) DebugInfo() map[string]interface{} {
 	info["PublishedTracks"] = publishedTrackInfo
 
 	return info
-}
-
-func (u *UpTrackManager) GetAudioLevel() (level float64, active bool) {
-	level = 0
-	for _, pt := range u.GetPublishedTracks() {
-		if pt.Source() == livekit.TrackSource_MICROPHONE {
-			tl, ta := pt.GetAudioLevel()
-			if ta {
-				active = true
-				if tl > level {
-					level = tl
-				}
-			}
-		}
-	}
-	return
 }

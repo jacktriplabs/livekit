@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package rtc
 
 import (
@@ -26,21 +12,17 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/pion/sctp"
-
+	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
-	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
-	sutils "github.com/livekit/livekit-server/pkg/utils"
 )
 
 const (
@@ -78,15 +60,10 @@ type Room struct {
 	egressLauncher EgressLauncher
 	trackManager   *RoomTrackManager
 
-	// agents
-	agentClient            AgentClient
-	publisherAgentsEnabled bool
-
 	// map of identity -> Participant
 	participants              map[livekit.ParticipantIdentity]types.LocalParticipant
 	participantOpts           map[livekit.ParticipantIdentity]*ParticipantOptions
 	participantRequestSources map[livekit.ParticipantIdentity]routing.MessageSource
-	hasPublished              map[livekit.ParticipantIdentity]bool
 	bufferFactory             *buffer.FactoryOfBufferFactory
 
 	// batch update participant info for non-publishers
@@ -99,8 +76,6 @@ type Room struct {
 	// time that the last participant left the room
 	leftAt atomic.Int64
 	closed chan struct{}
-
-	trailer []byte
 
 	onParticipantChanged func(p types.LocalParticipant)
 	onRoomUpdated        func()
@@ -118,55 +93,31 @@ func NewRoom(
 	audioConfig *config.AudioConfig,
 	serverInfo *livekit.ServerInfo,
 	telemetry telemetry.TelemetryService,
-	agentClient AgentClient,
 	egressLauncher EgressLauncher,
 ) *Room {
 	r := &Room{
-		protoRoom: proto.Clone(room).(*livekit.Room),
-		internal:  internal,
-		Logger: LoggerWithRoom(
-			logger.GetLogger().WithComponent(sutils.ComponentRoom),
-			livekit.RoomName(room.Name),
-			livekit.RoomID(room.Sid),
-		),
+		protoRoom:                 proto.Clone(room).(*livekit.Room),
+		internal:                  internal,
+		Logger:                    LoggerWithRoom(logger.GetLogger(), livekit.RoomName(room.Name), livekit.RoomID(room.Sid)),
 		config:                    config,
 		audioConfig:               audioConfig,
 		telemetry:                 telemetry,
 		egressLauncher:            egressLauncher,
-		agentClient:               agentClient,
 		trackManager:              NewRoomTrackManager(),
 		serverInfo:                serverInfo,
 		participants:              make(map[livekit.ParticipantIdentity]types.LocalParticipant),
 		participantOpts:           make(map[livekit.ParticipantIdentity]*ParticipantOptions),
 		participantRequestSources: make(map[livekit.ParticipantIdentity]routing.MessageSource),
-		hasPublished:              make(map[livekit.ParticipantIdentity]bool),
 		bufferFactory:             buffer.NewFactoryOfBufferFactory(config.Receiver.PacketBufferSize),
 		batchedUpdates:            make(map[livekit.ParticipantIdentity]*livekit.ParticipantInfo),
 		closed:                    make(chan struct{}),
-		trailer:                   []byte(utils.RandomSecret()),
 	}
-
 	r.protoProxy = utils.NewProtoProxy[*livekit.Room](roomUpdateInterval, r.updateProto)
 	if r.protoRoom.EmptyTimeout == 0 {
 		r.protoRoom.EmptyTimeout = DefaultEmptyTimeout
 	}
 	if r.protoRoom.CreationTime == 0 {
 		r.protoRoom.CreationTime = time.Now().Unix()
-	}
-
-	if agentClient != nil {
-		go func() {
-			res := r.agentClient.CheckEnabled(context.Background(), &rpc.CheckEnabledRequest{})
-			if res.PublisherEnabled {
-				r.lock.Lock()
-				r.publisherAgentsEnabled = true
-				// if there are already published tracks, start the agents
-				for identity := range r.hasPublished {
-					r.launchPublisherAgent(r.participants[identity])
-				}
-				r.lock.Unlock()
-			}
-		}()
 	}
 
 	go r.audioUpdateWorker()
@@ -186,15 +137,6 @@ func (r *Room) Name() livekit.RoomName {
 
 func (r *Room) ID() livekit.RoomID {
 	return livekit.RoomID(r.protoRoom.Sid)
-}
-
-func (r *Room) Trailer() []byte {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-
-	trailer := make([]byte, len(r.trailer))
-	copy(trailer, r.trailer)
-	return trailer
 }
 
 func (r *Room) GetParticipant(identity livekit.ParticipantIdentity) types.LocalParticipant {
@@ -450,6 +392,7 @@ func (r *Room) ReplaceParticipantRequestSource(identity livekit.ParticipantIdent
 		rs.Close()
 	}
 	r.participantRequestSources[identity] = reqSource
+
 	r.lock.Unlock()
 }
 
@@ -498,7 +441,6 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity, pID livek
 		delete(r.participants, identity)
 		delete(r.participantOpts, identity)
 		delete(r.participantRequestSources, identity)
-		delete(r.hasPublished, identity)
 		if !p.Hidden() {
 			r.protoRoom.NumParticipants--
 		}
@@ -573,7 +515,7 @@ func (r *Room) UpdateSubscriptions(
 	}
 
 	for _, pt := range participantTracks {
-		for _, trackID := range livekit.StringsAsIDs[livekit.TrackID](pt.TrackSids) {
+		for _, trackID := range livekit.StringsAsTrackIDs(pt.TrackSids) {
 			if subscribe {
 				participant.SubscribeToTrack(trackID)
 			} else {
@@ -607,10 +549,6 @@ func (r *Room) SyncState(participant types.LocalParticipant, state *livekit.Sync
 			}
 		}
 		if !found {
-			// is there a pending track?
-			found = participant.GetPendingTrack(livekit.TrackID(ti.Sid)) != nil
-		}
-		if !found {
 			pLogger.Warnw("unknown track during resume", nil, "trackID", ti.Sid)
 			shouldReconnect = true
 			break
@@ -624,7 +562,7 @@ func (r *Room) SyncState(participant types.LocalParticipant, state *livekit.Sync
 
 	r.UpdateSubscriptions(
 		participant,
-		livekit.StringsAsIDs[livekit.TrackID](state.Subscription.TrackSids),
+		livekit.StringsAsTrackIDs(state.Subscription.TrackSids),
 		state.Subscription.ParticipantTracks,
 		state.Subscription.Subscribe,
 	)
@@ -770,7 +708,9 @@ func (r *Room) sendRoomUpdate() {
 	roomInfo := r.ToProto()
 	// Send update to participants
 	for _, p := range r.GetParticipants() {
-		if !p.IsReady() {
+		// new participants receive the update as part of JoinResponse
+		// skip inactive participants
+		if p.State() != livekit.ParticipantInfo_ACTIVE {
 			continue
 		}
 
@@ -876,12 +816,11 @@ func (r *Room) createJoinResponseLocked(participant types.LocalParticipant, iceS
 		SubscriberPrimary:   participant.SubscriberAsPrimary(),
 		ClientConfiguration: participant.GetClientConfiguration(),
 		// sane defaults for ping interval & timeout
-		PingInterval:  PingIntervalSeconds,
-		PingTimeout:   PingTimeoutSeconds,
+		PingInterval:  10,
+		PingTimeout:   20,
 		ServerInfo:    r.serverInfo,
 		ServerVersion: r.serverInfo.Version,
 		ServerRegion:  r.serverInfo.Region,
-		SifTrailer:    r.trailer,
 	}
 }
 
@@ -922,47 +861,19 @@ func (r *Room) onTrackPublished(participant types.LocalParticipant, track types.
 
 	r.trackManager.AddTrack(track, participant.Identity(), participant.ID())
 
-	// launch jobs
-	r.lock.Lock()
-	hasPublished := r.hasPublished[participant.Identity()]
-	r.hasPublished[participant.Identity()] = true
-	publisherAgentsEnabled := r.publisherAgentsEnabled
-	r.lock.Unlock()
-
-	if !hasPublished {
-		if publisherAgentsEnabled {
-			r.launchPublisherAgent(participant)
-		}
-		if r.internal != nil && r.internal.ParticipantEgress != nil {
-			go func() {
-				if err := StartParticipantEgress(
-					context.Background(),
-					r.egressLauncher,
-					r.telemetry,
-					r.internal.ParticipantEgress,
-					participant.Identity(),
-					r.Name(),
-					r.ID(),
-				); err != nil {
-					r.Logger.Errorw("failed to launch participant egress", err)
-				}
-			}()
-		}
-	}
+	// auto track egress
 	if r.internal != nil && r.internal.TrackEgress != nil {
-		go func() {
-			if err := StartTrackEgress(
-				context.Background(),
-				r.egressLauncher,
-				r.telemetry,
-				r.internal.TrackEgress,
-				track,
-				r.Name(),
-				r.ID(),
-			); err != nil {
-				r.Logger.Errorw("failed to launch track egress", err)
-			}
-		}()
+		if err := StartTrackEgress(
+			context.Background(),
+			r.egressLauncher,
+			r.telemetry,
+			r.internal.TrackEgress,
+			track,
+			r.Name(),
+			r.ID(),
+		); err != nil {
+			r.Logger.Errorw("failed to launch track egress", err)
+		}
 	}
 }
 
@@ -985,7 +896,6 @@ func (r *Room) onTrackUnpublished(p types.LocalParticipant, track types.MediaTra
 }
 
 func (r *Room) onParticipantUpdate(p types.LocalParticipant) {
-	r.protoProxy.MarkDirty(false)
 	// immediately notify when permissions or metadata changed
 	r.broadcastParticipantState(p, broadcastOptions{immediate: true})
 	if r.onParticipantChanged != nil {
@@ -1123,15 +1033,6 @@ func (r *Room) pushAndDequeueUpdates(pi *livekit.ParticipantInfo, isImmediate bo
 				existing.State = livekit.ParticipantInfo_DISCONNECTED
 				updates = append(updates, existing)
 			} else {
-				// older session update, newer session has already become active, so nothing to do
-				return nil
-			}
-		}
-	} else {
-		ep := r.GetParticipant(identity)
-		if ep != nil {
-			epi := ep.ToProto()
-			if epi.JoinedAt > pi.JoinedAt {
 				// older session update, newer session has already become active, so nothing to do
 				return nil
 			}
@@ -1321,21 +1222,6 @@ func (r *Room) connectionQualityWorker() {
 	}
 }
 
-func (r *Room) launchPublisherAgent(p types.Participant) {
-	if p == nil || p.IsRecorder() || p.IsAgent() {
-		return
-	}
-
-	go func() {
-		r.agentClient.JobRequest(context.Background(), &livekit.Job{
-			Id:          utils.NewGuid("JP_"),
-			Type:        livekit.JobType_JT_PUBLISHER,
-			Room:        r.ToProto(),
-			Participant: p.ToProto(),
-		})
-	}()
-}
-
 func (r *Room) DebugInfo() map[string]interface{} {
 	info := map[string]interface{}{
 		"Name":      r.protoRoom.Name,
@@ -1356,7 +1242,6 @@ func (r *Room) DebugInfo() map[string]interface{} {
 func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, dp *livekit.DataPacket, logger logger.Logger) {
 	dest := dp.GetUser().GetDestinationSids()
 	var dpData []byte
-	destIdentities := dp.GetUser().GetDestinationIdentities()
 
 	participants := r.GetLocalParticipants()
 	capacity := len(dest)
@@ -1372,16 +1257,10 @@ func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, dp 
 		if source != nil && op.ID() == source.ID() {
 			continue
 		}
-		if len(dest) > 0 || len(destIdentities) > 0 {
+		if len(dest) > 0 {
 			found := false
 			for _, dID := range dest {
 				if op.ID() == livekit.ParticipantID(dID) {
-					found = true
-					break
-				}
-			}
-			for _, dIdentity := range destIdentities {
-				if op.Identity() == livekit.ParticipantIdentity(dIdentity) {
 					found = true
 					break
 				}
@@ -1403,8 +1282,7 @@ func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, dp 
 
 	utils.ParallelExec(destParticipants, dataForwardLoadBalanceThreshold, 1, func(op types.LocalParticipant) {
 		err := op.SendDataPacket(dp, dpData)
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, sctp.ErrStreamClosed) &&
-			!errors.Is(err, ErrTransportFailure) && !errors.Is(err, ErrDataChannelBufferFull) {
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 			op.GetLogger().Infow("send data packet error", "error", err)
 		}
 	})

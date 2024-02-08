@@ -1,17 +1,3 @@
-// Copyright 2023 LiveKit, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package videolayerselector
 
 import (
@@ -45,16 +31,11 @@ func (fc *FrameChain) OnFrame(extFrameNum uint64, fd *dd.FrameDependencyTemplate
 		return false
 	}
 
-	if len(fd.ChainDiffs) <= fc.chainIdx {
-		fc.logger.Warnw("invalid frame chain diff", nil, "chanIdx", fc.chainIdx, "frame", extFrameNum, "fd", fd)
-		return fc.broken
-	}
-
 	// A decodable frame with frame_chain_fdiff equal to 0 indicates that the Chain is intact.
 	if fd.ChainDiffs[fc.chainIdx] == 0 {
 		if fc.broken {
 			fc.broken = false
-			fc.logger.Debugw("frame chain intact", "chanIdx", fc.chainIdx, "frame", extFrameNum)
+			fc.logger.Debugw("frame chain intact", "chanIdx", fc.chainIdx)
 		}
 		fc.expectFrames = fc.expectFrames[:0]
 		return true
@@ -67,7 +48,7 @@ func (fc *FrameChain) OnFrame(extFrameNum uint64, fd *dd.FrameDependencyTemplate
 	prevFrameInChain := extFrameNum - uint64(fd.ChainDiffs[fc.chainIdx])
 	sd, err := fc.decisions.GetDecision(prevFrameInChain)
 	if err != nil {
-		fc.logger.Debugw("could not get decision", "err", err, "chanIdx", fc.chainIdx, "frame", extFrameNum, "prevFrame", prevFrameInChain)
+		fc.logger.Debugw("could not get decision", "err", err, "frame", extFrameNum, "prevFrame", prevFrameInChain)
 	}
 
 	var intact bool
@@ -92,15 +73,10 @@ func (fc *FrameChain) OnFrame(extFrameNum uint64, fd *dd.FrameDependencyTemplate
 }
 
 func (fc *FrameChain) OnExpectFrameChanged(frameNum uint64, decision selectorDecision) {
-	if fc.broken {
-		return
-	}
-
 	for i, f := range fc.expectFrames {
 		if f == frameNum {
 			if decision != selectorDecisionForwarded {
 				fc.broken = true
-				fc.logger.Debugw("frame chain broken", "chanIdx", fc.chainIdx, "sd", decision, "frame", frameNum)
 			}
 			fc.expectFrames[i] = fc.expectFrames[len(fc.expectFrames)-1]
 			fc.expectFrames = fc.expectFrames[:len(fc.expectFrames)-1]
