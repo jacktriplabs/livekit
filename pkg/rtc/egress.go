@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -16,6 +30,67 @@ import (
 type EgressLauncher interface {
 	StartEgress(context.Context, *rpc.StartEgressRequest) (*livekit.EgressInfo, error)
 	StartEgressWithClusterId(ctx context.Context, clusterId string, req *rpc.StartEgressRequest) (*livekit.EgressInfo, error)
+}
+
+func StartParticipantEgress(
+	ctx context.Context,
+	launcher EgressLauncher,
+	ts telemetry.TelemetryService,
+	opts *livekit.AutoParticipantEgress,
+	identity livekit.ParticipantIdentity,
+	roomName livekit.RoomName,
+	roomID livekit.RoomID,
+) error {
+	if req, err := startParticipantEgress(ctx, launcher, opts, identity, roomName, roomID); err != nil {
+		// send egress failed webhook
+		ts.NotifyEvent(ctx, &livekit.WebhookEvent{
+			Event: webhook.EventEgressEnded,
+			EgressInfo: &livekit.EgressInfo{
+				RoomId:   string(roomID),
+				RoomName: string(roomName),
+				Status:   livekit.EgressStatus_EGRESS_FAILED,
+				Error:    err.Error(),
+				Request:  &livekit.EgressInfo_Participant{Participant: req},
+			},
+		})
+		return err
+	}
+	return nil
+}
+
+func startParticipantEgress(
+	ctx context.Context,
+	launcher EgressLauncher,
+	opts *livekit.AutoParticipantEgress,
+	identity livekit.ParticipantIdentity,
+	roomName livekit.RoomName,
+	roomID livekit.RoomID,
+) (*livekit.ParticipantEgressRequest, error) {
+	req := &livekit.ParticipantEgressRequest{
+		RoomName:       string(roomName),
+		Identity:       string(identity),
+		FileOutputs:    opts.FileOutputs,
+		SegmentOutputs: opts.SegmentOutputs,
+	}
+
+	switch o := opts.Options.(type) {
+	case *livekit.AutoParticipantEgress_Preset:
+		req.Options = &livekit.ParticipantEgressRequest_Preset{Preset: o.Preset}
+	case *livekit.AutoParticipantEgress_Advanced:
+		req.Options = &livekit.ParticipantEgressRequest_Advanced{Advanced: o.Advanced}
+	}
+
+	if launcher == nil {
+		return req, errors.New("egress launcher not found")
+	}
+
+	_, err := launcher.StartEgress(ctx, &rpc.StartEgressRequest{
+		Request: &rpc.StartEgressRequest_Participant{
+			Participant: req,
+		},
+		RoomId: string(roomID),
+	})
+	return req, err
 }
 
 func StartTrackEgress(
@@ -52,7 +127,6 @@ func startTrackEgress(
 	roomName livekit.RoomName,
 	roomID livekit.RoomID,
 ) (*livekit.TrackEgressRequest, error) {
-
 	output := &livekit.DirectFileOutput{
 		Filepath: getFilePath(opts.Filepath),
 	}

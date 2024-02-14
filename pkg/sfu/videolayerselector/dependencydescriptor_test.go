@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package videolayerselector
 
 import (
@@ -123,9 +137,9 @@ func TestDependencyDescriptor(t *testing.T) {
 	ddSelector.SetRequestSpatial(1)
 
 	// no dd ext, dropped
-	ret := ddSelector.Select(&buffer.ExtPacket{}, 0)
+	ret := ddSelector.Select(&buffer.ExtPacket{Packet: &rtp.Packet{}}, 0)
 	require.False(t, ret.IsSelected)
-	require.True(t, ret.IsRelevant)
+	require.False(t, ret.IsRelevant)
 
 	// non key frame, dropped
 	ret = ddSelector.Select(&buffer.ExtPacket{
@@ -139,9 +153,10 @@ func TestDependencyDescriptor(t *testing.T) {
 				},
 			},
 		},
+		Packet: &rtp.Packet{},
 	}, 0)
 	require.False(t, ret.IsSelected)
-	require.True(t, ret.IsRelevant)
+	require.False(t, ret.IsRelevant)
 
 	frames := createDDFrames(buffer.VideoLayer{Spatial: 2, Temporal: 2}, 3)
 	// key frame, update structure and decode targets
@@ -243,11 +258,18 @@ func TestDependencyDescriptor(t *testing.T) {
 	locked, layer := ddSelector.CheckSync()
 	require.False(t, locked)
 	require.Equal(t, targetLayer.Spatial, layer)
-
 	// request to current layer, sync
 	ddSelector.SetRequestSpatial(ddSelector.GetCurrent().Spatial)
 	locked, _ = ddSelector.CheckSync()
 	require.True(t, locked)
+
+	// should drop frame that relies on a keyframe is not present in current selection
+	framesPrevious := createDDFrames(buffer.VideoLayer{Spatial: 2, Temporal: 2}, 1000)
+	ret = ddSelector.Select(framesPrevious[1], 0)
+	require.False(t, ret.IsSelected)
+	// keyframe lost, out of sync
+	locked, _ = ddSelector.CheckSync()
+	require.False(t, locked)
 }
 
 func createDDFrames(maxLayer buffer.VideoLayer, startFrameNumber uint16) []*buffer.ExtPacket {
@@ -269,7 +291,7 @@ func createDDFrames(maxLayer buffer.VideoLayer, startFrameNumber uint16) []*buff
 		return decodeTargets[i].Layer.GreaterThan(decodeTargets[j].Layer)
 	})
 
-	chainDiffs := make([]int, len(decodeTargets))
+	chainDiffs := make([]int, int(maxLayer.Spatial)+1)
 	dtis := make([]dd.DecodeTargetIndication, len(decodeTargets))
 	for _, dt := range decodeTargets {
 		dtis[dt.Target] = dd.DecodeTargetSwitch
@@ -307,6 +329,9 @@ func createDDFrames(maxLayer buffer.VideoLayer, startFrameNumber uint16) []*buff
 			DecodeTargets:              decodeTargets,
 			StructureUpdated:           true,
 			ActiveDecodeTargetsUpdated: true,
+			Integrity:                  true,
+			ExtFrameNum:                uint64(startFrameNumber),
+			ExtKeyFrameNum:             uint64(startFrameNumber),
 		},
 		Packet: &rtp.Packet{
 			Header: rtp.Header{
@@ -344,7 +369,6 @@ func createDDFrames(maxLayer buffer.VideoLayer, startFrameNumber uint16) []*buff
 			}
 
 			frame := &buffer.ExtPacket{
-				KeyFrame: true,
 				DependencyDescriptor: &buffer.ExtDependencyDescriptor{
 					Descriptor: &dd.DependencyDescriptor{
 						FrameNumber: startFrameNumber,
@@ -355,7 +379,10 @@ func createDDFrames(maxLayer buffer.VideoLayer, startFrameNumber uint16) []*buff
 							DecodeTargetIndications: frameDtis,
 						},
 					},
-					DecodeTargets: decodeTargets,
+					DecodeTargets:  decodeTargets,
+					Integrity:      true,
+					ExtFrameNum:    uint64(startFrameNumber),
+					ExtKeyFrameNum: keyFrame.DependencyDescriptor.ExtFrameNum,
 				},
 				Packet: &rtp.Packet{
 					Header: rtp.Header{

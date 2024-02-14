@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package routing
 
 import (
@@ -198,7 +212,7 @@ func (r *RedisRouter) WriteParticipantRTC(_ context.Context, roomName livekit.Ro
 		return err
 	}
 
-	rtcSink := NewRTCNodeSink(r.rc, livekit.NodeID(rtcNode), livekit.ConnectionID("ephemeral"), pkey, pkeyB62)
+	rtcSink := NewRTCNodeSink(r.rc, livekit.NodeID(rtcNode), "ephemeral", pkey, pkeyB62)
 	msg.ParticipantKey = string(ParticipantKeyLegacy(roomName, identity))
 	msg.ParticipantKeyB62 = string(ParticipantKey(roomName, identity))
 	return r.writeRTCMessage(rtcSink, msg)
@@ -215,7 +229,7 @@ func (r *RedisRouter) WriteRoomRTC(ctx context.Context, roomName livekit.RoomNam
 }
 
 func (r *RedisRouter) WriteNodeRTC(_ context.Context, rtcNodeID string, msg *livekit.RTCNodeMessage) error {
-	rtcSink := NewRTCNodeSink(r.rc, livekit.NodeID(rtcNodeID), livekit.ConnectionID("ephemeral"), livekit.ParticipantKey(msg.ParticipantKey), livekit.ParticipantKey(msg.ParticipantKeyB62))
+	rtcSink := NewRTCNodeSink(r.rc, livekit.NodeID(rtcNodeID), "ephemeral", livekit.ParticipantKey(msg.ParticipantKey), livekit.ParticipantKey(msg.ParticipantKeyB62))
 	return r.writeRTCMessage(rtcSink, msg)
 }
 

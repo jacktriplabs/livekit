@@ -11,9 +11,12 @@ import (
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	redis2 "github.com/livekit/protocol/redis"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
@@ -35,6 +38,7 @@ import (
 func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*LivekitServer, error) {
 	roomConfig := getRoomConf(conf)
 	apiConfig := config.DefaultAPIConfig()
+	psrpcConfig := getPSRPCConfig(conf)
 	universalClient, err := createRedisClient(conf)
 	if err != nil {
 		return nil, err
@@ -52,11 +56,16 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 	if err != nil {
 		return nil, err
 	}
-	egressClient, err := rpc.NewEgressClient(nodeID, messageBus)
+	agentClient, err := rtc.NewAgentClient(messageBus)
+	if err != nil {
+		return nil, err
+	}
+	egressClient, err := rpc.NewEgressClient(messageBus)
 	if err != nil {
 		return nil, err
 	}
 	egressStore := getEgressStore(objectStore)
+	ingressStore := getIngressStore(objectStore)
 	keyProvider, err := createKeyProvider(conf)
 	if err != nil {
 		return nil, err
@@ -67,27 +76,41 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 	}
 	analyticsService := telemetry.NewAnalyticsService(conf, currentNode)
 	telemetryService := telemetry.NewTelemetryService(queuedNotifier, analyticsService)
-	rtcEgressLauncher := NewEgressLauncher(egressClient, egressStore, telemetryService)
-	roomService, err := NewRoomService(roomConfig, apiConfig, router, roomAllocator, objectStore, rtcEgressLauncher)
+	ioInfoService, err := NewIOInfoService(messageBus, egressStore, ingressStore, telemetryService)
 	if err != nil {
 		return nil, err
 	}
-	egressService := NewEgressService(egressClient, objectStore, egressStore, roomService, telemetryService, rtcEgressLauncher)
+	rtcEgressLauncher := NewEgressLauncher(egressClient, ioInfoService)
+	topicFormatter := rpc.NewTopicFormatter()
+	clientParams := getPSRPCClientParams(psrpcConfig, messageBus)
+	roomClient, err := rpc.NewTypedRoomClient(clientParams)
+	if err != nil {
+		return nil, err
+	}
+	participantClient, err := rpc.NewTypedParticipantClient(clientParams)
+	if err != nil {
+		return nil, err
+	}
+	roomService, err := NewRoomService(roomConfig, apiConfig, psrpcConfig, router, roomAllocator, objectStore, agentClient, rtcEgressLauncher, topicFormatter, roomClient, participantClient)
+	if err != nil {
+		return nil, err
+	}
+	egressService := NewEgressService(egressClient, rtcEgressLauncher, objectStore, ioInfoService, roomService)
 	ingressConfig := getIngressConfig(conf)
-	ingressClient, err := rpc.NewIngressClient(nodeID, messageBus)
+	ingressClient, err := rpc.NewIngressClient(messageBus)
 	if err != nil {
 		return nil, err
 	}
-	ingressStore := getIngressStore(objectStore)
 	ingressService := NewIngressService(ingressConfig, nodeID, messageBus, ingressClient, ingressStore, roomService, telemetryService)
-	ioInfoService, err := NewIOInfoService(nodeID, messageBus, egressStore, ingressStore, telemetryService)
+	rtcService := NewRTCService(conf, roomAllocator, objectStore, router, currentNode, agentClient, telemetryService)
+	agentService, err := NewAgentService(messageBus)
 	if err != nil {
 		return nil, err
 	}
-	rtcService := NewRTCService(conf, roomAllocator, objectStore, router, currentNode, telemetryService)
 	clientConfigurationManager := createClientConfiguration()
 	timedVersionGenerator := utils.NewDefaultTimedVersionGenerator()
-	roomManager, err := NewLocalRoomManager(conf, objectStore, currentNode, router, telemetryService, clientConfigurationManager, rtcEgressLauncher, timedVersionGenerator)
+	turnAuthHandler := NewTURNAuthHandler(keyProvider)
+	roomManager, err := NewLocalRoomManager(conf, objectStore, currentNode, router, telemetryService, clientConfigurationManager, agentClient, rtcEgressLauncher, timedVersionGenerator, turnAuthHandler, messageBus)
 	if err != nil {
 		return nil, err
 	}
@@ -95,12 +118,12 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 	if err != nil {
 		return nil, err
 	}
-	authHandler := newTurnAuthHandler(objectStore)
+	authHandler := getTURNAuthHandlerFunc(turnAuthHandler)
 	server, err := newInProcessTurnServer(conf, authHandler)
 	if err != nil {
 		return nil, err
 	}
-	livekitServer, err := NewLivekitServer(conf, roomService, egressService, ingressService, ioInfoService, rtcService, keyProvider, router, roomManager, signalServer, server, currentNode)
+	livekitServer, err := NewLivekitServer(conf, roomService, egressService, ingressService, ioInfoService, rtcService, agentService, keyProvider, router, roomManager, signalServer, server, currentNode)
 	if err != nil {
 		return nil, err
 	}
@@ -132,10 +155,11 @@ func getNodeID(currentNode routing.LocalNode) livekit.NodeID {
 func createKeyProvider(conf *config.Config) (auth.KeyProvider, error) {
 
 	if conf.KeyFile != "" {
+		var otherFilter os.FileMode = 0007
 		if st, err := os.Stat(conf.KeyFile); err != nil {
 			return nil, err
-		} else if st.Mode().Perm() != 0600 {
-			return nil, fmt.Errorf("key file must have permission set to 600")
+		} else if st.Mode().Perm()&otherFilter != 0000 {
+			return nil, fmt.Errorf("key file others permissions must be set to 0")
 		}
 		f, err := os.Open(conf.KeyFile)
 		if err != nil {
@@ -223,6 +247,14 @@ func getRoomConf(config2 *config.Config) config.RoomConfig {
 
 func getSignalRelayConfig(config2 *config.Config) config.SignalRelayConfig {
 	return config2.SignalRelay
+}
+
+func getPSRPCConfig(config2 *config.Config) rpc.PSRPCConfig {
+	return config2.PSRPC
+}
+
+func getPSRPCClientParams(config2 rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+	return rpc.NewClientParams(config2, bus, logger.GetLogger(), prometheus.PSRPCMetricsObserver{})
 }
 
 func newInProcessTurnServer(conf *config.Config, authHandler turn.AuthHandler) (*turn.Server, error) {

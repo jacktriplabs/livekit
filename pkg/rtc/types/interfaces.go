@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package types
 
 import (
@@ -73,6 +87,7 @@ const (
 	ParticipantCloseReasonVerifyFailed
 	ParticipantCloseReasonJoinFailed
 	ParticipantCloseReasonJoinTimeout
+	ParticipantCloseReasonMessageBusFailed
 	ParticipantCloseReasonStateDisconnected
 	ParticipantCloseReasonPeerConnectionDisconnected
 	ParticipantCloseReasonDuplicateIdentity
@@ -88,6 +103,8 @@ const (
 	ParticipantCloseReasonOvercommitted
 	ParticipantCloseReasonPublicationError
 	ParticipantCloseReasonSubscriptionError
+	ParticipantCloseReasonDataChannelError
+	ParticipantCloseReasonMigrateCodecMismatch
 )
 
 func (p ParticipantCloseReason) String() string {
@@ -104,6 +121,8 @@ func (p ParticipantCloseReason) String() string {
 		return "JOIN_FAILED"
 	case ParticipantCloseReasonJoinTimeout:
 		return "JOIN_TIMEOUT"
+	case ParticipantCloseReasonMessageBusFailed:
+		return "MESSAGE_BUS_FAILED"
 	case ParticipantCloseReasonStateDisconnected:
 		return "STATE_DISCONNECTED"
 	case ParticipantCloseReasonPeerConnectionDisconnected:
@@ -134,6 +153,10 @@ func (p ParticipantCloseReason) String() string {
 		return "PUBLICATION_ERROR"
 	case ParticipantCloseReasonSubscriptionError:
 		return "SUBSCRIPTION_ERROR"
+	case ParticipantCloseReasonDataChannelError:
+		return "DATA_CHANNEL_ERROR"
+	case ParticipantCloseReasonMigrateCodecMismatch:
+		return "MIGRATE_CODEC_MISMATCH"
 	default:
 		return fmt.Sprintf("%d", int(p))
 	}
@@ -145,7 +168,7 @@ func (p ParticipantCloseReason) ToDisconnectReason() livekit.DisconnectReason {
 		return livekit.DisconnectReason_CLIENT_INITIATED
 	case ParticipantCloseReasonRoomManagerStop:
 		return livekit.DisconnectReason_SERVER_SHUTDOWN
-	case ParticipantCloseReasonVerifyFailed, ParticipantCloseReasonJoinFailed, ParticipantCloseReasonJoinTimeout:
+	case ParticipantCloseReasonVerifyFailed, ParticipantCloseReasonJoinFailed, ParticipantCloseReasonJoinTimeout, ParticipantCloseReasonMessageBusFailed:
 		// expected to be connected but is not
 		return livekit.DisconnectReason_JOIN_FAILURE
 	case ParticipantCloseReasonPeerConnectionDisconnected:
@@ -164,7 +187,7 @@ func (p ParticipantCloseReason) ToDisconnectReason() livekit.DisconnectReason {
 		return livekit.DisconnectReason_SERVER_SHUTDOWN
 	case ParticipantCloseReasonOvercommitted:
 		return livekit.DisconnectReason_SERVER_SHUTDOWN
-	case ParticipantCloseReasonNegotiateFailed, ParticipantCloseReasonPublicationError, ParticipantCloseReasonSubscriptionError:
+	case ParticipantCloseReasonNegotiateFailed, ParticipantCloseReasonPublicationError, ParticipantCloseReasonSubscriptionError, ParticipantCloseReasonDataChannelError, ParticipantCloseReasonMigrateCodecMismatch:
 		return livekit.DisconnectReason_STATE_MISMATCH
 	default:
 		// the other types will map to unknown reason
@@ -183,6 +206,7 @@ const (
 	SignallingCloseReasonTransportFailure
 	SignallingCloseReasonFullReconnectPublicationError
 	SignallingCloseReasonFullReconnectSubscriptionError
+	SignallingCloseReasonFullReconnectDataChannelError
 	SignallingCloseReasonFullReconnectNegotiateFailed
 	SignallingCloseReasonParticipantClose
 )
@@ -201,6 +225,8 @@ func (s SignallingCloseReason) String() string {
 		return "FULL_RECONNECT_PUBLICATION_ERROR"
 	case SignallingCloseReasonFullReconnectSubscriptionError:
 		return "FULL_RECONNECT_SUBSCRIPTION_ERROR"
+	case SignallingCloseReasonFullReconnectDataChannelError:
+		return "FULL_RECONNECT_DATA_CHANNEL_ERROR"
 	case SignallingCloseReasonFullReconnectNegotiateFailed:
 		return "FULL_RECONNECT_NEGOTIATE_FAILED"
 	case SignallingCloseReasonParticipantClose:
@@ -225,9 +251,11 @@ type Participant interface {
 	SetMetadata(metadata string)
 
 	IsPublisher() bool
-	GetPublishedTrack(sid livekit.TrackID) MediaTrack
+	GetPublishedTrack(trackID livekit.TrackID) MediaTrack
 	GetPublishedTracks() []MediaTrack
 	RemovePublishedTrack(track MediaTrack, willBeResumed bool, shouldClose bool)
+
+	GetAudioLevel() (smoothedLevel float64, active bool)
 
 	// HasPermission checks permission of the subscriber by identity. Returns true if subscriber is allowed to subscribe
 	// to the track with trackID
@@ -236,6 +264,7 @@ type Participant interface {
 	// permissions
 	Hidden() bool
 	IsRecorder() bool
+	IsAgent() bool
 
 	Start()
 	Close(sendLeave bool, reason ParticipantCloseReason, isExpectedToResume bool) error
@@ -277,9 +306,12 @@ type LocalParticipant interface {
 	ToProtoWithVersion() (*livekit.ParticipantInfo, utils.TimedVersion)
 
 	// getters
+	GetTrailer() []byte
 	GetLogger() logger.Logger
 	GetAdaptiveStream() bool
 	ProtocolVersion() ProtocolVersion
+	SupportsSyncStreamID() bool
+	SupportsTransceiverReuse() bool
 	ConnectedAt() time.Time
 	IsClosed() bool
 	IsReady() bool
@@ -290,11 +322,14 @@ type LocalParticipant interface {
 	GetClientConfiguration() *livekit.ClientConfiguration
 	GetICEConnectionType() ICEConnectionType
 	GetBufferFactory() *buffer.Factory
+	GetPlayoutDelayConfig() *livekit.PlayoutDelay
+	GetPendingTrack(trackID livekit.TrackID) *livekit.TrackInfo
 
 	SetResponseSink(sink routing.MessageSink)
 	CloseSignalConnection(reason SignallingCloseReason)
 	UpdateLastSeenSignal()
 	SetSignalSourceValid(valid bool)
+	HandleSignalSourceClose()
 
 	// permissions
 	ClaimGrants() *auth.ClaimGrants
@@ -307,7 +342,7 @@ type LocalParticipant interface {
 	AddICECandidate(candidate webrtc.ICECandidateInit, target livekit.SignalTarget)
 	HandleOffer(sdp webrtc.SessionDescription)
 	AddTrack(req *livekit.AddTrackRequest)
-	SetTrackMuted(trackID livekit.TrackID, muted bool, fromAdmin bool)
+	SetTrackMuted(trackID livekit.TrackID, muted bool, fromAdmin bool) *livekit.TrackInfo
 
 	HandleAnswer(sdp webrtc.SessionDescription)
 	Negotiate(force bool)
@@ -330,7 +365,6 @@ type LocalParticipant interface {
 	GetSubscribedParticipants() []livekit.ParticipantID
 	IsSubscribedTo(sid livekit.ParticipantID) bool
 
-	GetAudioLevel() (smoothedLevel float64, active bool)
 	GetConnectionQuality() *livekit.ConnectionQualityInfo
 
 	// server sent messages
@@ -413,6 +447,7 @@ type MediaTrack interface {
 	Kind() livekit.TrackType
 	Name() string
 	Source() livekit.TrackSource
+	Stream() string
 
 	ToProto() *livekit.TrackInfo
 
@@ -425,6 +460,8 @@ type MediaTrack interface {
 
 	UpdateVideoLayers(layers []*livekit.VideoLayer)
 	IsSimulcast() bool
+
+	GetAudioLevel() (level float64, active bool)
 
 	Close(willBeResumed bool)
 	IsOpen() bool
@@ -448,6 +485,8 @@ type MediaTrack interface {
 
 	Receivers() []sfu.TrackReceiver
 	ClearAllReceivers(willBeResumed bool)
+
+	IsEncrypted() bool
 }
 
 //counterfeiter:generate . LocalMediaTrack
@@ -459,7 +498,6 @@ type LocalMediaTrack interface {
 	SignalCid() string
 	HasSdpCid(cid string) bool
 
-	GetAudioLevel() (level float64, active bool)
 	GetConnectionScoreAndQuality() (float32, livekit.ConnectionQuality)
 
 	SetRTT(rtt uint32)

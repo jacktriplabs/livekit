@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -225,13 +239,22 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 	t.params.Logger.Debugw("AddReceiver", "mime", track.Codec().MimeType)
 	wr := t.MediaTrackReceiver.Receiver(mime)
 	if wr == nil {
-		var priority int
+		priority := -1
 		for idx, c := range t.params.TrackInfo.Codecs {
-			if strings.HasSuffix(mime, c.MimeType) {
+			if strings.EqualFold(mime, c.MimeType) {
 				priority = idx
 				break
 			}
 		}
+		if len(t.params.TrackInfo.Codecs) == 0 {
+			priority = 0
+		}
+		if priority < 0 {
+			t.params.Logger.Warnw("could not find codec for webrtc receiver", nil, "webrtcCodec", mime, "track", logger.Proto(t.params.TrackInfo))
+			t.lock.Unlock()
+			return false
+		}
+
 		newWR := sfu.NewWebRTCReceiver(
 			receiver,
 			track,
@@ -313,14 +336,14 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 		t.MediaTrackSubscriptions.UpdateVideoLayers()
 	})
 
-	buff.OnFinalRtpStats(func(stats *buffer.RTPStats) {
+	buff.OnFinalRtpStats(func(stats *livekit.RTPStats) {
 		t.params.Telemetry.TrackPublishRTPStats(
 			context.Background(),
 			t.params.ParticipantID,
 			t.ID(),
 			mime,
 			int(layer),
-			stats.ToProto(),
+			stats,
 		)
 	})
 	return newCodec
