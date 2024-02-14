@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package service_test
 
 import (
@@ -9,6 +23,8 @@ import (
 
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/rpc"
+	"github.com/livekit/protocol/rpc/rpcfakes"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing/routingfakes"
@@ -112,9 +128,19 @@ func newTestRoomService(conf config.RoomConfig) *TestRoomService {
 	router := &routingfakes.FakeRouter{}
 	allocator := &servicefakes.FakeRoomAllocator{}
 	store := &servicefakes.FakeServiceStore{}
-	svc, err := service.NewRoomService(conf,
+	svc, err := service.NewRoomService(
+		conf,
 		config.APIConfig{ExecutionTimeout: 2},
-		router, allocator, store, nil)
+		rpc.PSRPCConfig{},
+		router,
+		allocator,
+		store,
+		nil,
+		nil,
+		rpc.NewTopicFormatter(),
+		&rpcfakes.FakeTypedRoomClient{},
+		&rpcfakes.FakeTypedParticipantClient{},
+	)
 	if err != nil {
 		panic(err)
 	}

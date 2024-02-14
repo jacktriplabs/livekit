@@ -1,7 +1,22 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package buffer
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -16,14 +31,15 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/livekit/livekit-server/pkg/sfu/audio"
+	dd "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
+	"github.com/livekit/livekit-server/pkg/sfu/utils"
+	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/mediatransportutil"
 	"github.com/livekit/mediatransportutil/pkg/bucket"
 	"github.com/livekit/mediatransportutil/pkg/nack"
 	"github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-
-	dd "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
 )
 
 const (
@@ -38,6 +54,8 @@ type pendingPacket struct {
 type ExtPacket struct {
 	VideoLayer
 	Arrival              time.Time
+	ExtSequenceNumber    uint64
+	ExtTimestamp         uint64
 	Packet               *rtp.Packet
 	Payload              interface{}
 	KeyFrame             bool
@@ -65,7 +83,8 @@ type Buffer struct {
 	closed        atomic.Bool
 	mime          string
 
-	// supported feedbacks
+	snRangeMap *utils.RangeMap[uint64, uint64]
+
 	latestTSForAudioLevelInitialized bool
 	latestTSForAudioLevel            uint32
 
@@ -77,7 +96,7 @@ type Buffer struct {
 
 	pliThrottle int64
 
-	rtpStats             *RTPStats
+	rtpStats             *RTPStatsReceiver
 	rrSnapshotId         uint32
 	deltaStatsSnapshotId uint32
 
@@ -86,9 +105,9 @@ type Buffer struct {
 	// callbacks
 	onClose            func()
 	onRtcpFeedback     func([]rtcp.Packet)
-	onRtcpSenderReport func(*RTCPSenderReportData)
+	onRtcpSenderReport func()
 	onFpsChanged       func()
-	onFinalRtpStats    func(*RTPStats)
+	onFinalRtpStats    func(*livekit.RTPStats)
 
 	// logger
 	logger logger.Logger
@@ -100,6 +119,9 @@ type Buffer struct {
 	paused              bool
 	frameRateCalculator [DefaultMaxLayerSpatial + 1]FrameRateCalculator
 	frameRateCalculated bool
+
+	packetNotFoundCount atomic.Uint32
+	packetTooOldCount   atomic.Uint32
 }
 
 // NewBuffer constructs a new Buffer
@@ -109,8 +131,9 @@ func NewBuffer(ssrc uint32, vp, ap *sync.Pool) *Buffer {
 		mediaSSRC:   ssrc,
 		videoPool:   vp,
 		audioPool:   ap,
+		snRangeMap:  utils.NewRangeMap[uint64, uint64](100),
 		pliThrottle: int64(500 * time.Millisecond),
-		logger:      l,
+		logger:      l.WithComponent(sutils.ComponentPub).WithComponent(sutils.ComponentSFU),
 	}
 	b.extPackets.SetMinCapacity(7)
 	return b
@@ -120,9 +143,9 @@ func (b *Buffer) SetLogger(logger logger.Logger) {
 	b.Lock()
 	defer b.Unlock()
 
-	b.logger = logger
+	b.logger = logger.WithComponent(sutils.ComponentSFU)
 	if b.rtpStats != nil {
-		b.rtpStats.SetLogger(logger)
+		b.rtpStats.SetLogger(b.logger)
 	}
 }
 
@@ -154,7 +177,7 @@ func (b *Buffer) Bind(params webrtc.RTPParameters, codec webrtc.RTPCodecCapabili
 		return
 	}
 
-	b.rtpStats = NewRTPStats(RTPStatsParams{
+	b.rtpStats = NewRTPStatsReceiver(RTPStatsParams{
 		ClockRate: codec.ClockRate,
 		Logger:    b.logger,
 	})
@@ -167,7 +190,7 @@ func (b *Buffer) Bind(params webrtc.RTPParameters, codec webrtc.RTPCodecCapabili
 
 	for _, ext := range params.HeaderExtensions {
 		switch ext.URI {
-		case dd.ExtensionUrl:
+		case dd.ExtensionURI:
 			b.ddExt = uint8(ext.ID)
 			frc := NewFrameRateCalculatorDD(b.clockRate, b.logger)
 			for i := range b.frameRateCalculator {
@@ -227,7 +250,7 @@ func (b *Buffer) Bind(params webrtc.RTPParameters, codec webrtc.RTPCodecCapabili
 			// codec settings at track level for same codec type, so enable nack for all audio receivers but don't create nack queue
 			// for red codec.
 			if strings.EqualFold(b.mime, "audio/red") {
-				return
+				break
 			}
 			b.logger.Debugw("Setting feedback", "type", webrtc.TypeRTCPFBNACK)
 			b.nacker = nack.NewNACKQueue(nack.NackQueueParamsDefault)
@@ -329,7 +352,7 @@ func (b *Buffer) Close() error {
 			b.rtpStats.Stop()
 			b.logger.Infow("rtp stats", "direction", "upstream", "stats", b.rtpStats.ToString())
 			if b.onFinalRtpStats != nil {
-				b.onFinalRtpStats(b.rtpStats)
+				b.onFinalRtpStats(b.rtpStats.ToProto())
 			}
 		}
 
@@ -389,42 +412,73 @@ func (b *Buffer) SetRTT(rtt uint32) {
 }
 
 func (b *Buffer) calc(pkt []byte, arrivalTime time.Time) {
-	pktBuf, err := b.bucket.AddPacket(pkt)
-	if err != nil {
-		//
-		// Even when erroring, do
-		//  1. state update
-		//  2. TWCC just in case remote side is retransmitting an old packet for probing
-		//
-		// But, do not forward those packets
-		//
-		var rtpPacket rtp.Packet
-		if uerr := rtpPacket.Unmarshal(pkt); uerr == nil {
-			b.updateStreamState(&rtpPacket, arrivalTime)
-			b.processHeaderExtensions(&rtpPacket, arrivalTime)
-		}
+	defer func() {
+		b.doNACKs()
 
-		if err != bucket.ErrRTXPacket {
-			b.logger.Warnw("could not add RTP packet to bucket", err)
+		b.doReports(arrivalTime)
+	}()
+
+	var rtpPacket rtp.Packet
+	if err := rtpPacket.Unmarshal(pkt); err != nil {
+		b.logger.Errorw("could not unmarshal RTP packet", err)
+		return
+	}
+
+	// process header extensions always as padding packets could be used for probing
+	b.processHeaderExtensions(&rtpPacket, arrivalTime)
+
+	flowState := b.updateStreamState(&rtpPacket, arrivalTime)
+	if flowState.IsNotHandled {
+		return
+	}
+
+	if len(rtpPacket.Payload) == 0 && (!flowState.IsOutOfOrder || flowState.IsDuplicate) {
+		// drop padding only in-order or duplicate packet
+		if !flowState.IsOutOfOrder {
+			// in-order packet - increment sequence number offset for subsequent packets
+			// Example:
+			//   40 - regular packet - pass through as sequence number 40
+			//   41 - missing packet - don't know what it is, could be padding or not
+			//   42 - padding only packet - in-order - drop - increment sequence number offset to 1 -
+			//        range[0, 42] = 0 offset
+			//   41 - arrives out of order - get offset 0 from cache - passed through as sequence number 41
+			//   43 - regular packet - offset = 1 (running offset) - passes through as sequence number 42
+			//   44 - padding only - in order - drop - increment sequence number offset to 2
+			//        range[0, 42] = 0 offset, range[43, 44] = 1 offset
+			//   43 - regular packet - out of order + duplicate - offset = 1 from cache -
+			//        adjusted sequence number is 42, will be dropped by RTX buffer AddPacket method as duplicate
+			//   45 - regular packet - offset = 2 (running offset) - passed through with adjusted sequence number as 43
+			//   44 - padding only - out-of-order + duplicate - dropped as duplicate
+			//
+			if err := b.snRangeMap.ExcludeRange(flowState.ExtSequenceNumber, flowState.ExtSequenceNumber+1); err != nil {
+				b.logger.Errorw("could not exclude range", err, "sn", rtpPacket.SequenceNumber, "esn", flowState.ExtSequenceNumber)
+			}
 		}
 		return
 	}
 
-	var p rtp.Packet
-	err = p.Unmarshal(pktBuf)
+	// add to RTX buffer using sequence number after accounting for dropped padding only packets
+	snAdjustment, err := b.snRangeMap.GetValue(flowState.ExtSequenceNumber)
 	if err != nil {
-		b.logger.Warnw("error unmarshaling RTP packet", err)
+		b.logger.Errorw("could not get sequence number adjustment", err, "sn", flowState.ExtSequenceNumber, "payloadSize", len(rtpPacket.Payload))
+		return
+	}
+	flowState.ExtSequenceNumber -= snAdjustment
+	rtpPacket.Header.SequenceNumber = uint16(flowState.ExtSequenceNumber)
+	_, err = b.bucket.AddPacketWithSequenceNumber(pkt, rtpPacket.Header.SequenceNumber)
+	if err != nil {
+		if errors.Is(err, bucket.ErrPacketTooOld) {
+			packetTooOldCount := b.packetTooOldCount.Inc()
+			if packetTooOldCount%20 == 0 {
+				b.logger.Warnw("could not add packet to bucket", err, "count", packetTooOldCount)
+			}
+		} else if err != bucket.ErrRTXPacket {
+			b.logger.Warnw("could not add packet to bucket", err)
+		}
 		return
 	}
 
-	b.updateStreamState(&p, arrivalTime)
-	b.processHeaderExtensions(&p, arrivalTime)
-
-	b.doNACKs()
-
-	b.doReports(arrivalTime)
-
-	ep := b.getExtPacket(&p, arrivalTime)
+	ep := b.getExtPacket(&rtpPacket, arrivalTime, flowState)
 	if ep == nil {
 		return
 	}
@@ -436,7 +490,10 @@ func (b *Buffer) calc(pkt []byte, arrivalTime time.Time) {
 func (b *Buffer) patchExtPacket(ep *ExtPacket, buf []byte) *ExtPacket {
 	n, err := b.getPacket(buf, ep.Packet.SequenceNumber)
 	if err != nil {
-		b.logger.Warnw("could not get packet", err, "sn", ep.Packet.SequenceNumber, "headSN", b.bucket.HeadSequenceNumber())
+		packetNotFoundCount := b.packetNotFoundCount.Inc()
+		if packetNotFoundCount%20 == 0 {
+			b.logger.Warnw("could not get packet from bucket", err, "sn", ep.Packet.SequenceNumber, "headSN", b.bucket.HeadSequenceNumber(), "count", packetNotFoundCount)
+		}
 		return nil
 	}
 	ep.RawPacket = buf[:n]
@@ -482,18 +539,28 @@ func (b *Buffer) doFpsCalc(ep *ExtPacket) {
 	}
 }
 
-func (b *Buffer) updateStreamState(p *rtp.Packet, arrivalTime time.Time) {
-	flowState := b.rtpStats.Update(&p.Header, len(p.Payload), int(p.PaddingSize), arrivalTime)
+func (b *Buffer) updateStreamState(p *rtp.Packet, arrivalTime time.Time) RTPFlowState {
+	flowState := b.rtpStats.Update(
+		arrivalTime,
+		p.Header.SequenceNumber,
+		p.Header.Timestamp,
+		p.Header.Marker,
+		p.Header.MarshalSize(),
+		len(p.Payload),
+		int(p.PaddingSize),
+	)
 
 	if b.nacker != nil {
 		b.nacker.Remove(p.SequenceNumber)
 
 		if flowState.HasLoss {
 			for lost := flowState.LossStartInclusive; lost != flowState.LossEndExclusive; lost++ {
-				b.nacker.Push(lost)
+				b.nacker.Push(uint16(lost))
 			}
 		}
 	}
+
+	return flowState
 }
 
 func (b *Buffer) processHeaderExtensions(p *rtp.Packet, arrivalTime time.Time) {
@@ -516,7 +583,7 @@ func (b *Buffer) processHeaderExtensions(p *rtp.Packet, arrivalTime time.Time) {
 				if (p.Timestamp - b.latestTSForAudioLevel) < (1 << 31) {
 					duration := (int64(p.Timestamp) - int64(b.latestTSForAudioLevel)) * 1e3 / int64(b.clockRate)
 					if duration > 0 {
-						b.audioLevel.Observe(ext.Level, uint32(duration))
+						b.audioLevel.Observe(ext.Level, uint32(duration), arrivalTime)
 					}
 
 					b.latestTSForAudioLevel = p.Timestamp
@@ -526,10 +593,12 @@ func (b *Buffer) processHeaderExtensions(p *rtp.Packet, arrivalTime time.Time) {
 	}
 }
 
-func (b *Buffer) getExtPacket(rtpPacket *rtp.Packet, arrivalTime time.Time) *ExtPacket {
+func (b *Buffer) getExtPacket(rtpPacket *rtp.Packet, arrivalTime time.Time, flowState RTPFlowState) *ExtPacket {
 	ep := &ExtPacket{
-		Packet:  rtpPacket,
-		Arrival: arrivalTime,
+		Arrival:           arrivalTime,
+		ExtSequenceNumber: flowState.ExtSequenceNumber,
+		ExtTimestamp:      flowState.ExtTimestamp,
+		Packet:            rtpPacket,
 		VideoLayer: VideoLayer{
 			Spatial:  InvalidLayerSpatial,
 			Temporal: InvalidLayerTemporal,
@@ -544,7 +613,9 @@ func (b *Buffer) getExtPacket(rtpPacket *rtp.Packet, arrivalTime time.Time) *Ext
 	ep.Temporal = 0
 	if b.ddParser != nil {
 		ddVal, videoLayer, err := b.ddParser.Parse(ep.Packet)
-		if err == nil && ddVal != nil {
+		if err != nil {
+			return nil
+		} else if ddVal != nil {
 			ep.DependencyDescriptor = ddVal
 			ep.VideoLayer = videoLayer
 			// DD-TODO : notify active decode target change if changed.
@@ -612,8 +683,7 @@ func (b *Buffer) doNACKs() {
 }
 
 func (b *Buffer) doReports(arrivalTime time.Time) {
-	timeDiff := arrivalTime.Sub(b.lastReport)
-	if timeDiff < ReportDelta {
+	if time.Since(b.lastReport) < ReportDelta {
 		return
 	}
 
@@ -643,24 +713,24 @@ func (b *Buffer) buildReceptionReport() *rtcp.ReceptionReport {
 		return nil
 	}
 
-	return b.rtpStats.SnapshotRtcpReceptionReport(b.mediaSSRC, b.lastFractionLostToReport, b.rrSnapshotId)
+	return b.rtpStats.GetRtcpReceptionReport(b.mediaSSRC, b.lastFractionLostToReport, b.rrSnapshotId)
 }
 
 func (b *Buffer) SetSenderReportData(rtpTime uint32, ntpTime uint64) {
+	b.RLock()
 	srData := &RTCPSenderReportData{
 		RTPTimestamp: rtpTime,
 		NTPTimestamp: mediatransportutil.NtpTime(ntpTime),
 		At:           time.Now(),
 	}
 
-	b.RLock()
 	if b.rtpStats != nil {
 		b.rtpStats.SetRtcpSenderReportData(srData)
 	}
 	b.RUnlock()
 
 	if b.onRtcpSenderReport != nil {
-		b.onRtcpSenderReport(srData)
+		b.onRtcpSenderReport()
 	}
 }
 
@@ -714,11 +784,11 @@ func (b *Buffer) OnRtcpFeedback(fn func(fb []rtcp.Packet)) {
 	b.onRtcpFeedback = fn
 }
 
-func (b *Buffer) OnRtcpSenderReport(fn func(srData *RTCPSenderReportData)) {
+func (b *Buffer) OnRtcpSenderReport(fn func()) {
 	b.onRtcpSenderReport = fn
 }
 
-func (b *Buffer) OnFinalRtpStats(fn func(*RTPStats)) {
+func (b *Buffer) OnFinalRtpStats(fn func(*livekit.RTPStats)) {
 	b.onFinalRtpStats = fn
 }
 
@@ -772,7 +842,7 @@ func (b *Buffer) GetAudioLevel() (float64, bool) {
 		return 0, false
 	}
 
-	return b.audioLevel.GetLevel()
+	return b.audioLevel.GetLevel(time.Now())
 }
 
 func (b *Buffer) OnFpsChanged(f func()) {

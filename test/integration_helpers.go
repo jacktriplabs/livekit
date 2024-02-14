@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
@@ -17,6 +31,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/livekit-server/pkg/testutils"
 	testclient "github.com/livekit/livekit-server/test/client"
+	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -41,9 +56,7 @@ const (
 var roomClient livekit.RoomService
 
 func init() {
-	config.InitLoggerFromConfig(config.LoggingConfig{
-		Config: logger.Config{Level: "debug"},
-	})
+	config.InitLoggerFromConfig(&config.DefaultConfig.Logging)
 
 	prometheus.Init("test", livekit.NodeType_SERVER, "test")
 }
@@ -166,7 +179,7 @@ func createMultiNodeServer(nodeID string, port uint32) *service.LivekitServer {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
 	conf.Port = port
-	conf.RTC.UDPPort = port + 1
+	conf.RTC.UDPPort = rtcconfig.PortRange{Start: int(port) + 1}
 	conf.RTC.TCPPort = port + 2
 	conf.Redis.Address = "localhost:6379"
 	conf.Keys = map[string]string{testApiKey: testApiSecret}

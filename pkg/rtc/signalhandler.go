@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
@@ -32,12 +46,12 @@ func HandleParticipantSignal(room types.Room, participant types.LocalParticipant
 		// permission check happens later in SubscriptionManager
 		room.UpdateSubscriptions(
 			participant,
-			livekit.StringsAsTrackIDs(msg.Subscription.TrackSids),
+			livekit.StringsAsIDs[livekit.TrackID](msg.Subscription.TrackSids),
 			msg.Subscription.ParticipantTracks,
 			msg.Subscription.Subscribe,
 		)
 	case *livekit.SignalRequest_TrackSetting:
-		for _, sid := range livekit.StringsAsTrackIDs(msg.TrackSetting.TrackSids) {
+		for _, sid := range livekit.StringsAsIDs[livekit.TrackID](msg.TrackSetting.TrackSids) {
 			participant.UpdateSubscribedTrackSettings(sid, msg.TrackSetting)
 		}
 	case *livekit.SignalRequest_Leave:
