@@ -18,6 +18,7 @@ package rtc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -508,9 +509,21 @@ func (m *SubscriptionManager) subscribe(s *trackSubscription) error {
 	}
 
 	subTrack, err := track.AddSubscriber(m.params.Participant)
-	if err != nil && err != errAlreadySubscribed {
-		// ignore already subscribed error
+	if err != nil && !errors.Is(err, errAlreadySubscribed) {
+		// ignore error(s): already subscribed
+		if !errors.Is(err, ErrTrackNotAttached) && !errors.Is(err, ErrNoReceiver) {
+			// as track resolution could take some time, not logging errors due to waiting for track resolution
+			m.params.Logger.Warnw("add subscriber failed", err, "trackID", trackID)
+		}
 		return err
+	}
+	if err == errAlreadySubscribed {
+		m.params.Logger.Debugw(
+			"already subscribed to track",
+			"trackID", trackID,
+			"subscribedAudioCount", m.subscribedAudioCount.Load(),
+			"subscribedVideoCount", m.subscribedVideoCount.Load(),
+		)
 	}
 	if err == nil && subTrack != nil { // subTrack could be nil if already subscribed
 		subTrack.OnClose(func(willBeResumed bool) {
@@ -541,9 +554,14 @@ func (m *SubscriptionManager) subscribe(s *trackSubscription) error {
 		}
 
 		go m.params.OnTrackSubscribed(subTrack)
-	}
 
-	m.params.Logger.Debugw("subscribed to track", "trackID", trackID, "subscribedAudioCount", m.subscribedAudioCount.Load(), "subscribedVideoCount", m.subscribedVideoCount.Load())
+		m.params.Logger.Debugw(
+			"subscribed to track",
+			"trackID", trackID,
+			"subscribedAudioCount", m.subscribedAudioCount.Load(),
+			"subscribedVideoCount", m.subscribedVideoCount.Load(),
+		)
+	}
 
 	// add mark the participant as someone we've subscribed to
 	firstSubscribe := false
@@ -560,7 +578,7 @@ func (m *SubscriptionManager) subscribe(s *trackSubscription) error {
 	m.lock.Unlock()
 
 	if changedCB != nil && firstSubscribe {
-		go changedCB(publisherID, true)
+		changedCB(publisherID, true)
 	}
 	return nil
 }
@@ -601,7 +619,8 @@ func (m *SubscriptionManager) handleSourceTrackRemoved(trackID livekit.TrackID) 
 // - UpTrack was closed
 // - publisher revoked permissions for the participant
 func (m *SubscriptionManager) handleSubscribedTrackClose(s *trackSubscription, willBeResumed bool) {
-	s.logger.Debugw("subscribed track closed",
+	s.logger.Debugw(
+		"subscribed track closed",
 		"willBeResumed", willBeResumed,
 	)
 	wasBound := s.isBound()
@@ -809,8 +828,8 @@ func (s *trackSubscription) setSubscribedTrack(track types.SubscribedTrack) {
 	s.lock.Unlock()
 
 	if settings != nil && track != nil {
-		s.logger.Debugw("restoring subscriber settings", "settings", settings)
-		track.UpdateSubscriberSettings(settings)
+		s.logger.Debugw("restoring subscriber settings", "settings", logger.Proto(settings))
+		track.UpdateSubscriberSettings(settings, true)
 	}
 	if oldTrack != nil {
 		oldTrack.OnClose(nil)
@@ -881,7 +900,7 @@ func (s *trackSubscription) setSettings(settings *livekit.UpdateTrackSettings) {
 	subTrack := s.subscribedTrack
 	s.lock.Unlock()
 	if subTrack != nil {
-		subTrack.UpdateSubscriberSettings(settings)
+		subTrack.UpdateSubscriberSettings(settings, false)
 	}
 }
 
@@ -929,7 +948,7 @@ func (s *trackSubscription) handleSourceTrackRemoved() {
 	}
 
 	// source track removed, we would unsubscribe
-	s.logger.Infow("unsubscribing from track since source track was removed")
+	s.logger.Debugw("unsubscribing from track since source track was removed")
 	s.desired = false
 
 	s.setChangedNotifierLocked(nil)

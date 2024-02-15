@@ -70,6 +70,10 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		getIngressStore,
 		getIngressConfig,
 		NewIngressService,
+		rpc.NewSIPClient,
+		getSIPStore,
+		getSIPConfig,
+		NewSIPService,
 		NewRoomAllocator,
 		NewRoomService,
 		NewRTCService,
@@ -78,6 +82,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		getSignalRelayConfig,
 		NewDefaultSignalServer,
 		routing.NewSignalClient,
+		rpc.NewKeepalivePubSub,
 		getPSRPCConfig,
 		getPSRPCClientParams,
 		rpc.NewTopicFormatter,
@@ -99,7 +104,10 @@ func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routi
 		getNodeID,
 		getMessageBus,
 		getSignalRelayConfig,
+		getPSRPCConfig,
+		getPSRPCClientParams,
 		routing.NewSignalClient,
+		rpc.NewKeepalivePubSub,
 		routing.CreateRouter,
 	)
 
@@ -193,6 +201,19 @@ func getIngressStore(s ObjectStore) IngressStore {
 
 func getIngressConfig(conf *config.Config) *config.IngressConfig {
 	return &conf.Ingress
+}
+
+func getSIPStore(s ObjectStore) SIPStore {
+	switch store := s.(type) {
+	case *RedisStore:
+		return store
+	default:
+		return nil
+	}
+}
+
+func getSIPConfig(conf *config.Config) *config.SIPConfig {
+	return &conf.SIP
 }
 
 func createClientConfiguration() clientconfiguration.ClientConfigurationManager {
