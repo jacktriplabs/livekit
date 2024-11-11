@@ -35,6 +35,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
+	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
@@ -67,6 +68,8 @@ type RTCClient struct {
 
 	signalRequestInterceptor  SignalRequestInterceptor
 	signalResponseInterceptor SignalResponseInterceptor
+
+	icQueue [2]atomic.Pointer[webrtc.ICECandidate]
 
 	subscriberAsPrimary        atomic.Bool
 	publisherFullyEstablished  atomic.Bool
@@ -110,6 +113,7 @@ type Options struct {
 	Publish                   string
 	ClientInfo                *livekit.ClientInfo
 	DisabledCodecs            []webrtc.RTPCodecCapability
+	TokenCustomizer           func(token *auth.AccessToken, grants *auth.VideoGrant)
 	SignalRequestInterceptor  SignalRequestInterceptor
 	SignalResponseInterceptor SignalResponseInterceptor
 }
@@ -224,9 +228,6 @@ func NewRTCClient(conn *websocket.Conn, opts *Options) (*RTCClient, error) {
 	}
 
 	publisherHandler.OnICECandidateCalls(func(ic *webrtc.ICECandidate, t livekit.SignalTarget) error {
-		if ic == nil {
-			return nil
-		}
 		return c.SendIceCandidate(ic, livekit.SignalTarget_PUBLISHER)
 	})
 	publisherHandler.OnOfferCalls(c.onOffer)
@@ -554,11 +555,24 @@ func (c *RTCClient) sendRequest(msg *livekit.SignalRequest) error {
 }
 
 func (c *RTCClient) SendIceCandidate(ic *webrtc.ICECandidate, target livekit.SignalTarget) error {
-	trickle := rtc.ToProtoTrickle(ic.ToJSON())
-	trickle.Target = target
+	prevIC := c.icQueue[target].Swap(ic)
+	if prevIC == nil {
+		return nil
+	}
+
 	return c.SendRequest(&livekit.SignalRequest{
 		Message: &livekit.SignalRequest_Trickle{
-			Trickle: trickle,
+			Trickle: rtc.ToProtoTrickle(prevIC.ToJSON(), target, ic == nil),
+		},
+	})
+}
+
+func (c *RTCClient) SetAttributes(attrs map[string]string) error {
+	return c.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UpdateMetadata{
+			UpdateMetadata: &livekit.UpdateParticipantMetadata{
+				Attributes: attrs,
+			},
 		},
 	})
 }
@@ -679,19 +693,16 @@ func (c *RTCClient) PublishData(data []byte, kind livekit.DataPacket_Kind) error
 		return err
 	}
 
-	dp := &livekit.DataPacket{
-		Kind: kind,
+	dpData, err := proto.Marshal(&livekit.DataPacket{
 		Value: &livekit.DataPacket_User{
 			User: &livekit.UserPacket{Payload: data},
 		},
-	}
-
-	dpData, err := proto.Marshal(dp)
+	})
 	if err != nil {
 		return err
 	}
 
-	return c.publisher.SendDataPacket(dp, dpData)
+	return c.publisher.SendDataPacket(kind, dpData)
 }
 
 func (c *RTCClient) GetPublishedTrackIDs() []string {
@@ -732,12 +743,13 @@ func (c *RTCClient) ensurePublisherConnected() error {
 	}
 }
 
-func (c *RTCClient) handleDataMessage(_ livekit.DataPacket_Kind, data []byte) {
+func (c *RTCClient) handleDataMessage(kind livekit.DataPacket_Kind, data []byte) {
 	dp := &livekit.DataPacket{}
 	err := proto.Unmarshal(data, dp)
 	if err != nil {
 		return
 	}
+	dp.Kind = kind
 	if val, ok := dp.Value.(*livekit.DataPacket_User); ok {
 		if c.OnDataReceived != nil {
 			c.OnDataReceived(val.User.Payload, val.User.ParticipantSid)

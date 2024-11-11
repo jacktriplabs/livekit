@@ -56,7 +56,7 @@ type SubscribedTrack struct {
 	versionGenerator utils.TimedVersionGenerator
 	settingsLock     sync.Mutex
 	settings         *livekit.UpdateTrackSettings
-	settingsVersion  *utils.TimedVersion
+	settingsVersion  utils.TimedVersion
 
 	bindLock        sync.Mutex
 	bound           bool
@@ -139,9 +139,9 @@ func (t *SubscribedTrack) Bound(err error) {
 }
 
 // for DownTrack callback to notify us that it's closed
-func (t *SubscribedTrack) Close(willBeResumed bool) {
+func (t *SubscribedTrack) Close(isExpectedToResume bool) {
 	if onClose := t.onClose.Load(); onClose != nil {
-		go onClose.(func(bool))(willBeResumed)
+		go onClose.(func(bool))(isExpectedToResume)
 	}
 }
 
@@ -220,7 +220,7 @@ func (t *SubscribedTrack) UpdateSubscriberSettings(settings *livekit.UpdateTrack
 	}
 
 	isImmediate = isImmediate || (!settings.Disabled && settings.Disabled != t.isMutedLocked())
-	t.settings = proto.Clone(settings).(*livekit.UpdateTrackSettings)
+	t.settings = utils.CloneProto(settings)
 	t.settingsLock.Unlock()
 
 	if isImmediate {
@@ -243,7 +243,7 @@ func (t *SubscribedTrack) applySettings() {
 	}
 
 	t.logger.Debugw("updating subscriber track settings", "settings", logger.Proto(t.settings))
-	t.settingsVersion = t.versionGenerator.New()
+	t.settingsVersion = t.versionGenerator.Next()
 	settingsVersion := t.settingsVersion
 	t.settingsLock.Unlock()
 
@@ -264,7 +264,7 @@ func (t *SubscribedTrack) applySettings() {
 	}
 
 	t.settingsLock.Lock()
-	if settingsVersion.Compare(t.settingsVersion) != 0 {
+	if settingsVersion != t.settingsVersion {
 		// a newer settings has superceded this one
 		t.settingsLock.Unlock()
 		return

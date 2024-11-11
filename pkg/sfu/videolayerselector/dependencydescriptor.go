@@ -20,7 +20,7 @@ import (
 	"sync"
 
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
-	dede "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
+	dede "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -281,7 +281,7 @@ func (d *DependencyDescriptor) Select(extPkt *buffer.ExtPacket, _layer int32) (r
 		d.logger.Debugw(
 			"switch to target",
 			"highestDecodeTarget", highestDecodeTarget,
-			"current", d.currentLayer,
+			"previous", d.previousLayer,
 			"bitmask", *d.activeDecodeTargetsBitmask,
 			"fn", dd.FrameNumber,
 			"efn", extFrameNum,

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -29,15 +30,19 @@ import (
 	"github.com/pion/transport/v2/packetio"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils/mono"
 
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
-	dd "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
-	"github.com/livekit/livekit-server/pkg/sfu/rtpextension"
+	act "github.com/livekit/livekit-server/pkg/sfu/rtpextension/abscapturetime"
+	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
+	pd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/playoutdelay"
+	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 	"github.com/livekit/livekit-server/pkg/sfu/utils"
 )
 
@@ -54,14 +59,13 @@ type TrackSender interface {
 	// ID is the globally unique identifier for this Track.
 	ID() string
 	SubscriberID() livekit.ParticipantID
-	TrackInfoAvailable()
 	HandleRTCPSenderReportData(
 		payloadType webrtc.PayloadType,
 		isSVC bool,
 		layer int32,
-		srFirst *buffer.RTCPSenderReportData,
-		srNewest *buffer.RTCPSenderReportData,
+		publisherSRData *livekit.RTCPSenderReportState,
 	) error
+	Resync()
 }
 
 // -------------------------------------------------------------------
@@ -89,9 +93,9 @@ var (
 	ErrOutOfOrderSequenceNumberCacheMiss = errors.New("out-of-order sequence number not found in cache")
 	ErrPaddingOnlyPacket                 = errors.New("padding only packet that need not be forwarded")
 	ErrDuplicatePacket                   = errors.New("duplicate packet")
-	ErrSequenceNumberOffsetNotFound      = errors.New("sequence number offset not found")
 	ErrPaddingNotOnFrameBoundary         = errors.New("padding cannot send on non-frame boundary")
 	ErrDownTrackAlreadyBound             = errors.New("already bound")
+	ErrPayloadOverflow                   = errors.New("payload overflow")
 )
 
 var (
@@ -133,23 +137,27 @@ var (
 // -------------------------------------------------------------------
 
 type DownTrackState struct {
-	RTPStats                   *buffer.RTPStatsSender
+	RTPStats                   *rtpstats.RTPStatsSender
 	DeltaStatsSenderSnapshotId uint32
-	ForwarderState             ForwarderState
+	ForwarderState             *livekit.RTPForwarderState
 }
 
-func (d DownTrackState) String() string {
-	return fmt.Sprintf("DownTrackState{rtpStats: %s, deltaSender: %d, forwarder: %s}",
-		d.RTPStats, d.DeltaStatsSenderSnapshotId, d.ForwarderState.String())
+func (d DownTrackState) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	e.AddObject("RTPStats", d.RTPStats)
+	e.AddUint32("DeltaStatsSenderSnapshotId", d.DeltaStatsSenderSnapshotId)
+	e.AddObject("ForwarderState", logger.Proto(d.ForwarderState))
+	return nil
 }
 
 // -------------------------------------------------------------------
 
+/* STREAM-ALLOCATOR-DATA
 type NackInfo struct {
 	Timestamp      uint32
 	SequenceNumber uint16
 	Attempts       uint8
 }
+*/
 
 type DownTrackStreamAllocatorListener interface {
 	// RTCP received
@@ -180,11 +188,13 @@ type DownTrackStreamAllocatorListener interface {
 	// packet(s) sent
 	OnPacketsSent(dt *DownTrack, size int)
 
+	/* STREAM-ALLOCATOR-DATA
 	// NACKs received
 	OnNACK(dt *DownTrack, nackInfos []NackInfo)
 
 	// RTCP Receiver Report received
 	OnRTCPReceiverReport(dt *DownTrack, rr rtcp.ReceptionReport)
+	*/
 
 	// check if track should participate in BWE
 	IsBWEEnabled(dt *DownTrack) bool
@@ -196,16 +206,19 @@ type DownTrackStreamAllocatorListener interface {
 type ReceiverReportListener func(dt *DownTrack, report *rtcp.ReceiverReport)
 
 type DowntrackParams struct {
-	Codecs            []webrtc.RTPCodecParameters
-	Receiver          TrackReceiver
-	BufferFactory     *buffer.Factory
-	SubID             livekit.ParticipantID
-	StreamID          string
-	MaxTrack          int
-	PlayoutDelayLimit *livekit.PlayoutDelay
-	Pacer             pacer.Pacer
-	Logger            logger.Logger
-	Trailer           []byte
+	Codecs                         []webrtc.RTPCodecParameters
+	Source                         livekit.TrackSource
+	Receiver                       TrackReceiver
+	BufferFactory                  *buffer.Factory
+	SubID                          livekit.ParticipantID
+	StreamID                       string
+	MaxTrack                       int
+	PlayoutDelayLimit              *livekit.PlayoutDelay
+	Pacer                          pacer.Pacer
+	Logger                         logger.Logger
+	Trailer                        []byte
+	RTCPWriter                     func([]rtcp.Packet) error
+	DisableSenderReportPassThrough bool
 }
 
 // DownTrack implements TrackLocal, is the track used to write packets
@@ -227,12 +240,20 @@ type DownTrack struct {
 
 	forwarder *Forwarder
 
-	upstreamCodecs            []webrtc.RTPCodecParameters
-	codec                     webrtc.RTPCodecCapability
+	upstreamCodecs []webrtc.RTPCodecParameters
+	codec          webrtc.RTPCodecCapability
+	clockRate      uint32
+
+	// payload types for red codec only
+	isRED             bool
+	upstreamPrimaryPT uint8
+	primaryPT         uint8
+
 	absSendTimeExtID          int
 	transportWideExtID        int
 	dependencyDescriptorExtID int
 	playoutDelayExtID         int
+	absCaptureTimeExtID       int
 	transceiver               atomic.Pointer[webrtc.RTPTransceiver]
 	writeStream               webrtc.TrackLocalWriter
 	rtcpReader                *buffer.RTCPReader
@@ -240,16 +261,19 @@ type DownTrack struct {
 	listenerLock            sync.RWMutex
 	receiverReportListeners []ReceiverReportListener
 
-	bindLock  sync.Mutex
-	bound     atomic.Bool
-	onBinding func(error)
+	bindLock            sync.Mutex
+	bindState           atomic.Value
+	onBinding           func(error)
+	bindOnReceiverReady func()
 
 	isClosed             atomic.Bool
 	connected            atomic.Bool
 	bindAndConnectedOnce atomic.Bool
 	writable             atomic.Bool
+	writeStopped         atomic.Bool
+	isReceiverReady      bool
 
-	rtpStats *buffer.RTPStatsSender
+	rtpStats *rtpstats.RTPStatsSender
 
 	totalRepeatedNACKs atomic.Uint32
 
@@ -266,15 +290,17 @@ type DownTrack struct {
 	streamAllocatorListener         DownTrackStreamAllocatorListener
 	streamAllocatorReportGeneration int
 	streamAllocatorBytesCounter     atomic.Uint32
+	/* STREAM-ALLOCATOR-DATA
 	bytesSent                       atomic.Uint32
 	bytesRetransmitted              atomic.Uint32
+	*/
 
 	playoutDelay *PlayoutDelayController
 
 	pacer pacer.Pacer
 
 	maxLayerNotifierChMu     sync.RWMutex
-	maxLayerNotifierCh       chan struct{}
+	maxLayerNotifierCh       chan string
 	maxLayerNotifierChClosed bool
 
 	keyFrameRequesterChMu     sync.RWMutex
@@ -285,7 +311,32 @@ type DownTrack struct {
 	onStatsUpdate               func(dt *DownTrack, stat *livekit.AnalyticsStat)
 	onMaxSubscribedLayerChanged func(dt *DownTrack, layer int32)
 	onRttUpdate                 func(dt *DownTrack, rtt uint32)
-	onCloseHandler              func(willBeResumed bool)
+	onCloseHandler              func(isExpectedToResume bool)
+	onCodecNegotiated           func(webrtc.RTPCodecCapability)
+
+	createdAt int64
+}
+
+type bindState int
+
+const (
+	bindStateUnbound bindState = iota
+	// downtrack negotiated, but waiting for receiver to be ready to start forwarding
+	bindStateWaitForReceiverReady
+	// downtrack is bound and ready to forward
+	bindStateBound
+)
+
+func (bs bindState) String() string {
+	switch bs {
+	case bindStateUnbound:
+		return "unbound"
+	case bindStateWaitForReceiverReady:
+		return "waitForReceiverReady"
+	case bindStateBound:
+		return "bound"
+	}
+	return "unknown"
 }
 
 // NewDownTrack returns a DownTrack.
@@ -307,36 +358,32 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 		upstreamCodecs:      codecs,
 		kind:                kind,
 		codec:               codecs[0].RTPCodecCapability,
+		clockRate:           codecs[0].ClockRate,
 		pacer:               params.Pacer,
-		maxLayerNotifierCh:  make(chan struct{}, 1),
+		maxLayerNotifierCh:  make(chan string, 1),
 		keyFrameRequesterCh: make(chan struct{}, 1),
+		createdAt:           time.Now().UnixNano(),
 	}
+	d.bindState.Store(bindStateUnbound)
+	d.params.Logger = params.Logger.WithValues(
+		"subscriberID", d.SubscriberID(),
+	)
 	d.forwarder = NewForwarder(
 		d.kind,
-		params.Logger,
-		d.params.Receiver.GetReferenceLayerRTPTimestamp,
+		d.params.Logger,
+		false,
 		d.getExpectedRTPTimestamp,
 	)
 
-	d.rtpStats = buffer.NewRTPStatsSender(buffer.RTPStatsParams{
+	d.rtpStats = rtpstats.NewRTPStatsSender(rtpstats.RTPStatsParams{
 		ClockRate: d.codec.ClockRate,
-		Logger:    params.Logger,
+		Logger:    d.params.Logger,
 	})
 	d.deltaStatsSenderSnapshotId = d.rtpStats.NewSenderSnapshotId()
 
-	if delay := params.PlayoutDelayLimit; delay.GetEnabled() {
-		var err error
-		d.playoutDelay, err = NewPlayoutDelayController(delay.GetMin(), delay.GetMax(), params.Logger, d.rtpStats)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	d.connectionStats = connectionquality.NewConnectionStats(connectionquality.ConnectionStatsParams{
-		MimeType:       codecs[0].MimeType, // LK-TODO have to notify on codec change
-		IsFECEnabled:   strings.EqualFold(codecs[0].MimeType, webrtc.MimeTypeOpus) && strings.Contains(strings.ToLower(codecs[0].SDPFmtpLine), "fec"),
 		SenderProvider: d,
-		Logger:         params.Logger.WithValues("direction", "down"),
+		Logger:         d.params.Logger.WithValues("direction", "down"),
 	})
 	d.connectionStats.OnStatsUpdate(func(_cs *connectionquality.ConnectionStats, stat *livekit.AnalyticsStat) {
 		if onStatsUpdate := d.getOnStatsUpdate(); onStatsUpdate != nil {
@@ -345,12 +392,27 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 	})
 
 	if d.kind == webrtc.RTPCodecTypeVideo {
+		if delay := params.PlayoutDelayLimit; delay.GetEnabled() {
+			var err error
+			d.playoutDelay, err = NewPlayoutDelayController(delay.GetMin(), delay.GetMax(), params.Logger, d.rtpStats)
+			if err != nil {
+				return nil, err
+			}
+		}
 		go d.maxLayerNotifierWorker()
 		go d.keyFrameRequester()
 	}
-	d.params.Logger.Debugw("downtrack created")
+
+	d.params.Receiver.AddOnReady(d.handleReceiverReady)
+	d.params.Logger.Debugw("downtrack created", "upstreamCodecs", d.upstreamCodecs)
 
 	return d, nil
+}
+
+func (d *DownTrack) OnCodecNegotiated(f func(webrtc.RTPCodecCapability)) {
+	d.bindLock.Lock()
+	d.onCodecNegotiated = f
+	d.bindLock.Unlock()
 }
 
 // Bind is called by the PeerConnection after negotiation is complete
@@ -358,15 +420,16 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 // If so it sets up all the state (SSRC and PayloadType) to have a call
 func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
 	d.bindLock.Lock()
-	if d.bound.Load() {
+	if d.bindState.Load() != bindStateUnbound {
 		d.bindLock.Unlock()
 		return webrtc.RTPCodecParameters{}, ErrDownTrackAlreadyBound
 	}
-	var codec webrtc.RTPCodecParameters
+	var codec, matchedUpstreamCodec webrtc.RTPCodecParameters
 	for _, c := range d.upstreamCodecs {
 		matchCodec, err := utils.CodecParametersFuzzySearch(c, t.CodecParameters())
 		if err == nil {
 			codec = matchCodec
+			matchedUpstreamCodec = c
 			break
 		}
 	}
@@ -379,7 +442,8 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		if onBinding != nil {
 			onBinding(err)
 		}
-		return webrtc.RTPCodecParameters{}, err
+		// don't return error here, as pion will not start transports if Bind fails at first answer
+		return webrtc.RTPCodecParameters{}, nil
 	}
 
 	// if a downtrack is closed before bind, it already unsubscribed from client, don't do subsequent operation and return here.
@@ -388,28 +452,6 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		d.bindLock.Unlock()
 		return codec, nil
 	}
-
-	d.params.Logger.Debugw("DownTrack.Bind", "codecs", d.upstreamCodecs, "matchCodec", codec, "ssrc", t.SSRC())
-	d.ssrc = uint32(t.SSRC())
-	d.payloadType = uint8(codec.PayloadType)
-	d.writeStream = t.WriteStream()
-	d.mime = strings.ToLower(codec.MimeType)
-	if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, uint32(t.SSRC())).(*buffer.RTCPReader); rr != nil {
-		rr.OnPacket(func(pkt []byte) {
-			d.handleRTCP(pkt)
-		})
-		d.rtcpReader = rr
-	}
-
-	d.sequencer = newSequencer(d.params.MaxTrack, d.kind == webrtc.RTPCodecTypeVideo, d.params.Logger)
-
-	d.codec = codec.RTPCodecCapability
-	if d.onBinding != nil {
-		d.onBinding(nil)
-	}
-	d.bound.Store(true)
-	d.onBindAndConnectedChange()
-	d.bindLock.Unlock()
 
 	// Bind is called under RTPSender.mu lock, call the RTPSender.GetParameters in goroutine to avoid deadlock
 	go func() {
@@ -422,28 +464,138 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		}
 	}()
 
-	d.forwarder.DetermineCodec(d.codec, d.params.Receiver.HeaderExtensions())
-	d.params.Logger.Debugw("downtrack bound")
+	doBind := func() {
+		d.bindLock.Lock()
+		if d.IsClosed() {
+			d.bindLock.Unlock()
+			d.params.Logger.Debugw("DownTrack closed before bind")
+			return
+		}
 
+		if bs := d.bindState.Load(); bs != bindStateWaitForReceiverReady {
+			d.bindLock.Unlock()
+			d.params.Logger.Debugw("DownTrack.Bind: not in wait for receiver state", "state", bs)
+			return
+		}
+
+		isFECEnabled := false
+		if strings.EqualFold(matchedUpstreamCodec.MimeType, MimeTypeAudioRed) {
+			d.isRED = true
+			for _, c := range d.upstreamCodecs {
+				isFECEnabled = strings.Contains(strings.ToLower(c.SDPFmtpLine), "useinbandfec=1")
+
+				// assume upstream primary codec is opus since we only support it for audio now
+				if strings.EqualFold(c.MimeType, webrtc.MimeTypeOpus) {
+					d.upstreamPrimaryPT = uint8(c.PayloadType)
+					break
+				}
+			}
+			if d.upstreamPrimaryPT == 0 {
+				d.params.Logger.Errorw("failed to find upstream primary opus payload type for RED", nil, "matchedCodec", codec, "upstreamCodec", d.upstreamCodecs)
+			}
+
+			var primaryPT, secondaryPT int
+			if n, err := fmt.Sscanf(codec.SDPFmtpLine, "%d/%d", &primaryPT, &secondaryPT); err != nil || n != 2 {
+				d.params.Logger.Errorw("failed to parse primary and secondary payload type for RED", err, "matchedCodec", codec)
+			}
+			d.primaryPT = uint8(primaryPT)
+		} else if strings.HasPrefix(strings.ToLower(matchedUpstreamCodec.MimeType), "audio/") {
+			isFECEnabled = strings.Contains(strings.ToLower(matchedUpstreamCodec.SDPFmtpLine), "fec")
+		}
+
+		logFields := []interface{}{
+			"codecs", d.upstreamCodecs,
+			"matchCodec", codec,
+			"ssrc", t.SSRC(),
+			"isFECEnabled", isFECEnabled,
+		}
+		if d.isRED {
+			logFields = append(logFields,
+				"isRED", d.isRED,
+				"upstreamPrimaryPT", d.upstreamPrimaryPT,
+				"primaryPT", d.primaryPT,
+			)
+		}
+		d.params.Logger.Debugw("DownTrack.Bind",
+			logFields...,
+		)
+
+		d.ssrc = uint32(t.SSRC())
+		d.payloadType = uint8(codec.PayloadType)
+		d.writeStream = t.WriteStream()
+		d.mime = strings.ToLower(codec.MimeType)
+		if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, uint32(t.SSRC())).(*buffer.RTCPReader); rr != nil {
+			rr.OnPacket(func(pkt []byte) {
+				d.handleRTCP(pkt)
+			})
+			d.rtcpReader = rr
+		}
+
+		d.sequencer = newSequencer(d.params.MaxTrack, d.kind == webrtc.RTPCodecTypeVideo, d.params.Logger)
+
+		d.codec = codec.RTPCodecCapability
+		if d.onBinding != nil {
+			d.onBinding(nil)
+		}
+		d.setBindStateLocked(bindStateBound)
+		d.bindLock.Unlock()
+
+		d.forwarder.DetermineCodec(codec.RTPCodecCapability, d.params.Receiver.HeaderExtensions())
+		d.connectionStats.Start(codec.MimeType, isFECEnabled)
+		d.params.Logger.Debugw("downtrack bound")
+	}
+
+	isReceiverReady := d.isReceiverReady
+	if !isReceiverReady {
+		d.params.Logger.Debugw("downtrack bound: receiver not ready", "codec", codec)
+		d.bindOnReceiverReady = doBind
+		d.setBindStateLocked(bindStateWaitForReceiverReady)
+	}
+
+	onCodecNegotiated := d.onCodecNegotiated
+	d.bindLock.Unlock()
+
+	if onCodecNegotiated != nil {
+		onCodecNegotiated(codec.RTPCodecCapability)
+	}
+
+	if isReceiverReady {
+		doBind()
+	}
 	return codec, nil
+}
+
+func (d *DownTrack) setBindStateLocked(state bindState) {
+	if d.bindState.Swap(state) == state {
+		return
+	}
+
+	if state == bindStateBound || state == bindStateUnbound {
+		d.bindOnReceiverReady = nil
+		d.onBindAndConnectedChange()
+	}
+}
+
+func (d *DownTrack) handleReceiverReady() {
+	d.params.Logger.Debugw("downtrack receiver ready")
+	d.bindLock.Lock()
+	d.isReceiverReady = true
+	doBind := d.bindOnReceiverReady
+	d.bindOnReceiverReady = nil
+	d.bindLock.Unlock()
+
+	if doBind != nil {
+		doBind()
+	}
 }
 
 // Unbind implements the teardown logic when the track is no longer needed. This happens
 // because a track has been stopped.
 func (d *DownTrack) Unbind(_ webrtc.TrackLocalContext) error {
 	d.bindLock.Lock()
-	d.bound.Store(false)
-	d.onBindAndConnectedChange()
+	d.setBindStateLocked(bindStateUnbound)
 	d.bindLock.Unlock()
 	return nil
-}
-
-func (d *DownTrack) TrackInfoAvailable() {
-	ti := d.params.Receiver.TrackInfo()
-	if ti == nil {
-		return
-	}
-	d.connectionStats.Start(ti)
 }
 
 func (d *DownTrack) SetStreamAllocatorListener(listener DownTrackStreamAllocatorListener) {
@@ -519,22 +671,25 @@ func (d *DownTrack) ClearStreamAllocatorReportInterval() {
 func (d *DownTrack) ID() string { return string(d.id) }
 
 // Codec returns current track codec capability
-func (d *DownTrack) Codec() webrtc.RTPCodecCapability { return d.codec }
+func (d *DownTrack) Codec() webrtc.RTPCodecCapability {
+	d.bindLock.Lock()
+	defer d.bindLock.Unlock()
+	return d.codec
+}
 
 // StreamID is the group this track belongs too. This must be unique
 func (d *DownTrack) StreamID() string { return d.params.StreamID }
 
-func (d *DownTrack) SubscriberID() livekit.ParticipantID { return d.params.SubID }
+func (d *DownTrack) SubscriberID() livekit.ParticipantID {
+	// add `createdAt` to ensure repeated subscriptions from same subscrober to same publisher does not collide
+	return livekit.ParticipantID(fmt.Sprintf("%s:%d", d.params.SubID, d.createdAt))
+}
 
 // Sets RTP header extensions for this track
 func (d *DownTrack) SetRTPHeaderExtensions(rtpHeaderExtensions []webrtc.RTPHeaderExtensionParameter) {
-	d.streamAllocatorLock.RLock()
-	listener := d.streamAllocatorListener
-	d.streamAllocatorLock.RUnlock()
-
 	isBWEEnabled := true
-	if listener != nil {
-		isBWEEnabled = listener.IsBWEEnabled(d)
+	if sal := d.getStreamAllocatorListener(); sal != nil {
+		isBWEEnabled = sal.IsBWEEnabled(d)
 	}
 	for _, ext := range rtpHeaderExtensions {
 		switch ext.URI {
@@ -546,7 +701,7 @@ func (d *DownTrack) SetRTPHeaderExtensions(rtpHeaderExtensions []webrtc.RTPHeade
 			}
 		case dd.ExtensionURI:
 			d.dependencyDescriptorExtID = ext.ID
-		case rtpextension.PlayoutDelayURI:
+		case pd.PlayoutDelayURI:
 			d.playoutDelayExtID = ext.ID
 		case sdp.TransportCCURI:
 			if isBWEEnabled {
@@ -554,6 +709,8 @@ func (d *DownTrack) SetRTPHeaderExtensions(rtpHeaderExtensions []webrtc.RTPHeade
 			} else {
 				d.transportWideExtID = 0
 			}
+		case act.AbsCaptureTimeURI:
+			d.absCaptureTimeExtID = ext.ID
 		}
 	}
 }
@@ -614,21 +771,23 @@ func (d *DownTrack) keyFrameRequester() {
 		return time.Duration(interval) * time.Millisecond
 	}
 
-	interval := getInterval()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(math.MaxInt64)
+	timer.Stop()
 
-	for {
-		if d.IsClosed() {
-			return
-		}
+	defer timer.Stop()
+
+	for !d.IsClosed() {
+		timer.Reset(getInterval())
 
 		select {
 		case _, more := <-d.keyFrameRequesterCh:
 			if !more {
 				return
 			}
-		case <-ticker.C:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 
 		locked, layer := d.forwarder.CheckSync()
@@ -637,12 +796,10 @@ func (d *DownTrack) keyFrameRequester() {
 			d.params.Receiver.SendPLI(layer, false)
 			d.rtpStats.UpdateLayerLockPliAndTime(1)
 		}
-
-		ticker.Reset(getInterval())
 	}
 }
 
-func (d *DownTrack) postMaxLayerNotifierEvent() {
+func (d *DownTrack) postMaxLayerNotifierEvent(event string) {
 	if d.kind != webrtc.RTPCodecTypeVideo {
 		return
 	}
@@ -650,26 +807,36 @@ func (d *DownTrack) postMaxLayerNotifierEvent() {
 	d.maxLayerNotifierChMu.RLock()
 	if !d.maxLayerNotifierChClosed {
 		select {
-		case d.maxLayerNotifierCh <- struct{}{}:
+		case d.maxLayerNotifierCh <- event:
 		default:
+			d.params.Logger.Debugw("max layer notifier channel busy", "event", event)
 		}
 	}
 	d.maxLayerNotifierChMu.RUnlock()
 }
 
 func (d *DownTrack) maxLayerNotifierWorker() {
-	more := true
-	for more {
-		_, more = <-d.maxLayerNotifierCh
+	for event := range d.maxLayerNotifierCh {
+		maxLayerSpatial := d.forwarder.GetMaxSubscribedSpatial()
+		d.params.Logger.Debugw("max subscribed layer processed", "layer", maxLayerSpatial, "event", event)
 
-		maxLayerSpatial := buffer.InvalidLayerSpatial
-		if more {
-			maxLayerSpatial = d.forwarder.GetMaxSubscribedSpatial()
-		}
 		if onMaxSubscribedLayerChanged := d.getOnMaxLayerChanged(); onMaxSubscribedLayerChanged != nil {
-			d.params.Logger.Debugw("max subscribed layer changed", "maxLayerSpatial", maxLayerSpatial)
+			d.params.Logger.Debugw(
+				"notifying max subscribed layer",
+				"layer", maxLayerSpatial,
+				"event", event,
+			)
 			onMaxSubscribedLayerChanged(d, maxLayerSpatial)
 		}
+	}
+
+	if onMaxSubscribedLayerChanged := d.getOnMaxLayerChanged(); onMaxSubscribedLayerChanged != nil {
+		d.params.Logger.Debugw(
+			"notifying max subscribed layer",
+			"layer", buffer.InvalidLayerSpatial,
+			"event", "close",
+		)
+		onMaxSubscribedLayerChanged(d, buffer.InvalidLayerSpatial)
 	}
 }
 
@@ -687,37 +854,79 @@ func (d *DownTrack) WriteRTP(extPkt *buffer.ExtPacket, layer int32) error {
 		return err
 	}
 
-	var payload []byte
 	poolEntity := PacketFactory.Get().(*[]byte)
-	if len(tp.codecBytes) != 0 {
-		incomingVP8, ok := extPkt.Payload.(buffer.VP8)
-		if ok {
-			payload = d.translateVP8PacketTo(extPkt.Packet, &incomingVP8, tp.codecBytes, poolEntity)
-		}
+	payload := *poolEntity
+	copy(payload, tp.codecBytes)
+	n := copy(payload[len(tp.codecBytes):], extPkt.Packet.Payload[tp.incomingHeaderSize:])
+	if n != len(extPkt.Packet.Payload[tp.incomingHeaderSize:]) {
+		d.params.Logger.Errorw("payload overflow", nil, "want", len(extPkt.Packet.Payload[tp.incomingHeaderSize:]), "have", n)
+		PacketFactory.Put(poolEntity)
+		return ErrPayloadOverflow
 	}
-	if payload == nil {
-		payload = (*poolEntity)[:len(extPkt.Packet.Payload)]
-		copy(payload, extPkt.Packet.Payload)
-	}
+	payload = payload[:len(tp.codecBytes)+n]
 
-	hdr, err := d.getTranslatedRTPHeader(extPkt, tp)
+	hdr, err := d.getTranslatedRTPHeader(extPkt, &tp)
 	if err != nil {
 		d.params.Logger.Errorw("could not get translated RTP header", err)
-		if poolEntity != nil {
-			PacketFactory.Put(poolEntity)
-		}
+		PacketFactory.Put(poolEntity)
 		return err
 	}
 
 	var extensions []pacer.ExtensionData
 	if tp.ddBytes != nil {
-		extensions = []pacer.ExtensionData{{ID: uint8(d.dependencyDescriptorExtID), Payload: tp.ddBytes}}
+		extensions = append(
+			extensions,
+			pacer.ExtensionData{
+				ID:      uint8(d.dependencyDescriptorExtID),
+				Payload: tp.ddBytes,
+			},
+		)
 	}
 	if d.playoutDelayExtID != 0 && d.playoutDelay != nil {
 		if val := d.playoutDelay.GetDelayExtension(hdr.SequenceNumber); val != nil {
-			extensions = append(extensions, pacer.ExtensionData{ID: uint8(d.playoutDelayExtID), Payload: val})
+			extensions = append(
+				extensions,
+				pacer.ExtensionData{
+					ID:      uint8(d.playoutDelayExtID),
+					Payload: val,
+				},
+			)
+
+			// NOTE: play out delay extension is not cached in sequencer,
+			// i. e. they will not be added to retransmitted packet.
+			// But, it is okay as the extension is added till a RTCP Receiver Report for
+			// the corresponding sequence number is received.
+			// The extreme case is all packets containing the play out delay are lost and
+			// all of them retransmitted and an RTCP Receiver Report received for those
+			// retransmitted sequence numbers. But, that is highly improbable, if not impossible.
 		}
 	}
+	var actBytes []byte
+	if extPkt.AbsCaptureTimeExt != nil && d.absCaptureTimeExtID != 0 {
+		// normalize capture time to SFU clock.
+		// NOTE: even if there is estimated offset populated, just re-map the
+		// absolute capture time stamp as it should be the same RTCP sender report
+		// clock domain of publisher. SFU is normalising sender reports of publisher
+		// to SFU clock before sending to subscribers. So, capture time should be
+		// normalized to the same clock. Clear out any offset.
+		_, _, refSenderReport := d.forwarder.GetSenderReportParams()
+		if refSenderReport != nil {
+			actExtCopy := *extPkt.AbsCaptureTimeExt
+			if err = actExtCopy.Rewrite(rtpstats.RTCPSenderReportPropagationDelay(refSenderReport, !d.params.DisableSenderReportPassThrough)); err == nil {
+				actBytes, err = actExtCopy.Marshal()
+				if err == nil {
+					extensions = append(
+						extensions,
+						pacer.ExtensionData{
+							ID:      uint8(d.absCaptureTimeExtID),
+							Payload: actBytes,
+						},
+					)
+				}
+			}
+		}
+	}
+
 	if d.sequencer != nil {
 		d.sequencer.push(
 			extPkt.Arrival,
@@ -726,8 +935,10 @@ func (d *DownTrack) WriteRTP(extPkt *buffer.ExtPacket, layer int32) error {
 			tp.rtp.extTimestamp,
 			hdr.Marker,
 			int8(layer),
-			tp.codecBytes,
+			payload[:len(tp.codecBytes)],
+			tp.incomingHeaderSize,
 			tp.ddBytes,
+			actBytes,
 		)
 	}
 
@@ -740,7 +951,8 @@ func (d *DownTrack) WriteRTP(extPkt *buffer.ExtPacket, layer int32) error {
 			extSequenceNumber: tp.rtp.extSequenceNumber,
 			extTimestamp:      tp.rtp.extTimestamp,
 			isKeyFrame:        extPkt.KeyFrame,
-			tp:                tp,
+			isOutOfOrder:      extPkt.IsOutOfOrder,
+			tp:                &tp,
 		},
 	)
 	d.pacer.Enqueue(pacer.Packet{
@@ -833,7 +1045,7 @@ func (d *DownTrack) WritePaddingRTP(bytesToSend int, paddingOnMute bool, forceMa
 			&hdr,
 			len(payload),
 			&sendPacketMetadata{
-				packetTime:           time.Now(),
+				packetTime:           mono.UnixNano(),
 				extSequenceNumber:    snts[i].extSequenceNumber,
 				extTimestamp:         snts[i].extTimestamp,
 				isPadding:            true,
@@ -857,13 +1069,9 @@ func (d *DownTrack) WritePaddingRTP(bytesToSend int, paddingOnMute bool, forceMa
 
 // Mute enables or disables media forwarding - subscriber triggered
 func (d *DownTrack) Mute(muted bool) {
-	d.streamAllocatorLock.RLock()
-	listener := d.streamAllocatorListener
-	d.streamAllocatorLock.RUnlock()
-
 	isSubscribeMutable := true
-	if listener != nil {
-		isSubscribeMutable = listener.IsSubscribeMutable(d)
+	if sal := d.getStreamAllocatorListener(); sal != nil {
+		isSubscribeMutable = sal.IsSubscribeMutable(d)
 	}
 	changed := d.forwarder.Mute(muted, isSubscribeMutable)
 	d.handleMute(muted, changed)
@@ -902,7 +1110,7 @@ func (d *DownTrack) handleMute(muted bool, changed bool) {
 	// Note that while publisher mute is active, subscriber changes can also happen
 	// and that could turn on/off layers on publisher side.
 	//
-	d.postMaxLayerNotifierEvent()
+	d.postMaxLayerNotifierEvent("mute")
 
 	if sal := d.getStreamAllocatorListener(); sal != nil {
 		sal.OnSubscriptionChanged(d)
@@ -947,7 +1155,7 @@ func (d *DownTrack) CloseWithFlush(flush bool) {
 
 	d.bindLock.Lock()
 	d.params.Logger.Debugw("close down track", "flushBlankFrame", flush)
-	if d.bound.Load() {
+	if d.bindState.Load() == bindStateBound {
 		d.forwarder.Mute(true, true)
 
 		// write blank frames after disabling so that other frames do not interfere.
@@ -968,26 +1176,25 @@ func (d *DownTrack) CloseWithFlush(flush bool) {
 			}
 		}
 
-		d.bound.Store(false)
-		d.onBindAndConnectedChange()
 		d.params.Logger.Debugw("closing sender", "kind", d.kind)
 	}
-	d.params.Receiver.DeleteDownTrack(d.params.SubID)
+	d.setBindStateLocked(bindStateUnbound)
+	d.params.Receiver.DeleteDownTrack(d.SubscriberID())
 
 	if d.rtcpReader != nil && flush {
 		d.params.Logger.Debugw("downtrack close rtcp reader")
 		d.rtcpReader.Close()
 		d.rtcpReader.OnPacket(nil)
 	}
-
 	d.bindLock.Unlock()
+
 	d.connectionStats.Close()
+
 	d.rtpStats.Stop()
 	d.params.Logger.Debugw("rtp stats",
 		"direction", "downstream",
 		"mime", d.mime,
 		"ssrc", d.ssrc,
-		// evaluate only if log level matches
 		"stats", d.rtpStats,
 	)
 
@@ -1014,7 +1221,7 @@ func (d *DownTrack) SetMaxSpatialLayer(spatialLayer int32) {
 		return
 	}
 
-	d.postMaxLayerNotifierEvent()
+	d.postMaxLayerNotifierEvent("max-subscribed")
 
 	if sal := d.getStreamAllocatorListener(); sal != nil {
 		sal.OnSubscribedLayerChanged(d, maxLayer)
@@ -1037,18 +1244,32 @@ func (d *DownTrack) MaxLayer() buffer.VideoLayer {
 }
 
 func (d *DownTrack) GetState() DownTrackState {
-	dts := DownTrackState{
+	return DownTrackState{
 		RTPStats:                   d.rtpStats,
 		DeltaStatsSenderSnapshotId: d.deltaStatsSenderSnapshotId,
 		ForwarderState:             d.forwarder.GetState(),
 	}
-	return dts
 }
 
 func (d *DownTrack) SeedState(state DownTrackState) {
-	d.rtpStats.Seed(state.RTPStats)
-	d.deltaStatsSenderSnapshotId = state.DeltaStatsSenderSnapshotId
+	if state.RTPStats != nil || state.ForwarderState != nil {
+		d.params.Logger.Debugw("seeding down track state", "state", state)
+	}
+	if state.RTPStats != nil {
+		d.rtpStats.Seed(state.RTPStats)
+		d.deltaStatsSenderSnapshotId = state.DeltaStatsSenderSnapshotId
+	}
 	d.forwarder.SeedState(state.ForwarderState)
+}
+
+func (d *DownTrack) StopWriteAndGetState() DownTrackState {
+	d.params.Logger.Debugw("stopping write")
+	d.bindLock.Lock()
+	d.writable.Store(false)
+	d.writeStopped.Store(true)
+	d.bindLock.Unlock()
+
+	return d.GetState()
 }
 
 func (d *DownTrack) UpTrackLayersChange() {
@@ -1079,7 +1300,7 @@ func (d *DownTrack) UpTrackMaxTemporalLayerSeenChange(maxTemporalLayerSeen int32
 	}
 }
 
-func (d *DownTrack) maybeAddTransition(_bitrate int64, distance float64, pauseReason VideoPauseReason) {
+func (d *DownTrack) maybeAddTransition(bitrate int64, distance float64, pauseReason VideoPauseReason) {
 	if d.kind == webrtc.RTPCodecTypeAudio {
 		return
 	}
@@ -1089,6 +1310,7 @@ func (d *DownTrack) maybeAddTransition(_bitrate int64, distance float64, pauseRe
 	} else {
 		d.connectionStats.UpdatePause(false)
 		d.connectionStats.AddLayerTransition(distance)
+		d.connectionStats.AddBitrateTransition(bitrate)
 	}
 }
 
@@ -1101,14 +1323,14 @@ func (d *DownTrack) UpTrackBitrateReport(availableLayers []int32, bitrates Bitra
 }
 
 // OnCloseHandler method to be called on remote tracked removed
-func (d *DownTrack) OnCloseHandler(fn func(willBeResumed bool)) {
+func (d *DownTrack) OnCloseHandler(fn func(isExpectedToResume bool)) {
 	d.cbMu.Lock()
 	defer d.cbMu.Unlock()
 
 	d.onCloseHandler = fn
 }
 
-func (d *DownTrack) getOnCloseHandler() func(willBeResumed bool) {
+func (d *DownTrack) getOnCloseHandler() func(isExpectedToResume bool) {
 	d.cbMu.RLock()
 	defer d.cbMu.RUnlock()
 
@@ -1210,7 +1432,7 @@ func (d *DownTrack) ProvisionalAllocateGetCooperativeTransition(allowOvershoot b
 	transition, availableLayers, brs := d.forwarder.ProvisionalAllocateGetCooperativeTransition(allowOvershoot)
 	d.params.Logger.Debugw(
 		"stream: cooperative transition",
-		"transition", transition,
+		"transition", &transition,
 		"availableLayers", availableLayers,
 		"bitrates", brs,
 	)
@@ -1221,7 +1443,7 @@ func (d *DownTrack) ProvisionalAllocateGetBestWeightedTransition() VideoTransiti
 	transition, availableLayers, brs := d.forwarder.ProvisionalAllocateGetBestWeightedTransition()
 	d.params.Logger.Debugw(
 		"stream: best weighted transition",
-		"transition", transition,
+		"transition", &transition,
 		"availableLayers", availableLayers,
 		"bitrates", brs,
 	)
@@ -1269,7 +1491,7 @@ func (d *DownTrack) Resync() {
 
 func (d *DownTrack) CreateSourceDescriptionChunks() []rtcp.SourceDescriptionChunk {
 	transceiver := d.transceiver.Load()
-	if !d.bound.Load() || transceiver == nil {
+	if d.bindState.Load() != bindStateBound || transceiver == nil {
 		return nil
 	}
 	return []rtcp.SourceDescriptionChunk{
@@ -1290,15 +1512,12 @@ func (d *DownTrack) CreateSourceDescriptionChunks() []rtcp.SourceDescriptionChun
 }
 
 func (d *DownTrack) CreateSenderReport() *rtcp.SenderReport {
-	if !d.bound.Load() {
+	if d.bindState.Load() != bindStateBound {
 		return nil
 	}
 
-	clockLayer := d.forwarder.CurrentLayer().Spatial
-	if clockLayer == buffer.InvalidLayerSpatial {
-		clockLayer = d.forwarder.GetReferenceLayerSpatial()
-	}
-	return d.rtpStats.GetRtcpSenderReport(d.ssrc, d.params.Receiver.GetCalculatedClockRate(clockLayer))
+	_, tsOffset, refSenderReport := d.forwarder.GetSenderReportParams()
+	return d.rtpStats.GetRtcpSenderReport(d.ssrc, refSenderReport, tsOffset, !d.params.DisableSenderReportPassThrough)
 }
 
 func (d *DownTrack) writeBlankFrameRTP(duration float32, generation uint32) chan struct{} {
@@ -1312,13 +1531,13 @@ func (d *DownTrack) writeBlankFrameRTP(duration float32, generation uint32) chan
 
 		var getBlankFrame func(bool) ([]byte, error)
 		switch d.mime {
-		case "audio/opus":
+		case strings.ToLower(webrtc.MimeTypeOpus):
 			getBlankFrame = d.getOpusBlankFrame
-		case "audio/red":
+		case strings.ToLower(MimeTypeAudioRed):
 			getBlankFrame = d.getOpusRedBlankFrame
-		case "video/vp8":
+		case strings.ToLower(webrtc.MimeTypeVP8):
 			getBlankFrame = d.getVP8BlankFrame
-		case "video/h264":
+		case strings.ToLower(webrtc.MimeTypeH264):
 			getBlankFrame = d.getH264BlankFrame
 		default:
 			close(done)
@@ -1326,7 +1545,7 @@ func (d *DownTrack) writeBlankFrameRTP(duration float32, generation uint32) chan
 		}
 
 		frameRate := uint32(30)
-		if d.mime == "audio/opus" || d.mime == "audio/red" {
+		if d.mime == strings.ToLower(webrtc.MimeTypeOpus) || d.mime == strings.ToLower(MimeTypeAudioRed) {
 			frameRate = 50
 		}
 
@@ -1372,7 +1591,7 @@ func (d *DownTrack) writeBlankFrameRTP(duration float32, generation uint32) chan
 				}
 
 				d.sendingPacket(&hdr, len(payload), &sendPacketMetadata{
-					packetTime:        time.Now(),
+					packetTime:        mono.UnixNano(),
 					extSequenceNumber: snts[i].extSequenceNumber,
 					extTimestamp:      snts[i].extTimestamp,
 				})
@@ -1434,20 +1653,20 @@ func (d *DownTrack) getOpusRedBlankFrame(_frameEndNeeded bool) ([]byte, error) {
 }
 
 func (d *DownTrack) getVP8BlankFrame(frameEndNeeded bool) ([]byte, error) {
-	blankVP8, err := d.forwarder.GetPadding(frameEndNeeded)
-	if err != nil {
-		return nil, err
-	}
-
 	// 8x8 key frame
 	// Used even when closing out a previous frame. Looks like receivers
 	// do not care about content (it will probably end up being an undecodable
 	// frame, but that should be okay as there are key frames following)
+	header, err := d.forwarder.GetPadding(frameEndNeeded)
+	if err != nil {
+		return nil, err
+	}
+
 	payload := make([]byte, 1000)
-	copy(payload[:len(blankVP8)], blankVP8)
-	copy(payload[len(blankVP8):], VP8KeyFrame8x8)
-	trailerLen := d.maybeAddTrailer(payload[len(blankVP8)+len(VP8KeyFrame8x8):])
-	return payload[:len(blankVP8)+len(VP8KeyFrame8x8)+trailerLen], nil
+	copy(payload, header)
+	copy(payload[len(header):], VP8KeyFrame8x8)
+	trailerLen := d.maybeAddTrailer(payload[len(header)+len(VP8KeyFrame8x8):])
+	return payload[:len(header)+len(VP8KeyFrame8x8)+trailerLen], nil
 }
 
 func (d *DownTrack) getH264BlankFrame(_frameEndNeeded bool) ([]byte, error) {
@@ -1497,12 +1716,16 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 	for _, pkt := range pkts {
 		switch p := pkt.(type) {
 		case *rtcp.PictureLossIndication:
-			numPLIs++
-			sendPliOnce()
+			if p.MediaSSRC == d.ssrc {
+				numPLIs++
+				sendPliOnce()
+			}
 
 		case *rtcp.FullIntraRequest:
-			numFIRs++
-			sendPliOnce()
+			if p.MediaSSRC == d.ssrc {
+				numFIRs++
+				sendPliOnce()
+			}
 
 		case *rtcp.ReceiverEstimatedMaximumBitrate:
 			if sal := d.getStreamAllocatorListener(); sal != nil {
@@ -1526,38 +1749,74 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 					rttToReport = rtt
 				}
 
+				/* STREAM-ALLOCATOR-DATA
 				if sal := d.getStreamAllocatorListener(); sal != nil {
 					sal.OnRTCPReceiverReport(d, r)
 				}
+				*/
 
 				if d.playoutDelay != nil {
-					jitterMs := uint64(r.Jitter*1e3) / uint64(d.codec.ClockRate)
 					d.playoutDelay.OnSeqAcked(uint16(r.LastSequenceNumber))
-					d.playoutDelay.SetJitter(uint32(jitterMs))
+					// screen share track has inaccuracy jitter due to its low frame rate and bursty traffic
+					if d.params.Source != livekit.TrackSource_SCREEN_SHARE {
+						jitterMs := uint64(r.Jitter*1e3) / uint64(d.clockRate)
+						d.playoutDelay.SetJitter(uint32(jitterMs))
+					}
 				}
 			}
 			if len(rr.Reports) > 0 {
 				d.listenerLock.RLock()
-				for _, l := range d.receiverReportListeners {
+				rrListeners := d.receiverReportListeners
+				d.listenerLock.RUnlock()
+				for _, l := range rrListeners {
 					l(d, rr)
 				}
-				d.listenerLock.RUnlock()
 			}
 
 		case *rtcp.TransportLayerNack:
-			var nacks []uint16
-			for _, pair := range p.Nacks {
-				packetList := pair.PacketList()
-				numNACKs += uint32(len(packetList))
-				nacks = append(nacks, packetList...)
+			if p.MediaSSRC == d.ssrc {
+				var nacks []uint16
+				for _, pair := range p.Nacks {
+					packetList := pair.PacketList()
+					numNACKs += uint32(len(packetList))
+					nacks = append(nacks, packetList...)
+				}
+				go d.retransmitPackets(nacks)
 			}
-			go d.retransmitPackets(nacks)
 
 		case *rtcp.TransportLayerCC:
 			if p.MediaSSRC == d.ssrc {
 				if sal := d.getStreamAllocatorListener(); sal != nil {
 					sal.OnTransportCCFeedback(d, p)
 				}
+			}
+
+		case *rtcp.ExtendedReport:
+			// SFU only responds with the DLRRReport for the track has the sender SSRC, the behavior is different with
+			// browser's implementation, which includes all sent tracks. It is ok since all the tracks
+			// use the same connection, and server-sdk-go can get the rtt from the first DLRRReport
+			// (libwebrtc/browsers don't send XR to calculate rtt, it only responds)
+			var lastRR uint32
+			for _, report := range p.Reports {
+				if rr, ok := report.(*rtcp.ReceiverReferenceTimeReportBlock); ok {
+					lastRR = uint32(rr.NTPTimestamp >> 16)
+					break
+				}
+			}
+
+			if lastRR > 0 {
+				d.params.RTCPWriter([]rtcp.Packet{&rtcp.ExtendedReport{
+					SenderSSRC: d.ssrc,
+					Reports: []rtcp.ReportBlock{
+						&rtcp.DLRRReportBlock{
+							Reports: []rtcp.DLRRReport{{
+								SSRC:   p.SenderSSRC,
+								LastRR: lastRR,
+								DLRR:   0, // no delay
+							}},
+						},
+					},
+				}})
 			}
 		}
 	}
@@ -1613,18 +1872,20 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 	nackAcks := uint32(0)
 	nackMisses := uint32(0)
 	numRepeatedNACKs := uint32(0)
-	nackInfos := make([]NackInfo, 0, len(filtered))
+	// STREAM-ALLOCATOR-DATA nackInfos := make([]NackInfo, 0, len(filtered))
 	for _, epm := range d.sequencer.getExtPacketMetas(filtered) {
 		if disallowedLayers[epm.layer] {
 			continue
 		}
 
 		nackAcks++
+		/* STREAM-ALLOCATOR-DATA
 		nackInfos = append(nackInfos, NackInfo{
 			SequenceNumber: epm.targetSeqNo,
 			Timestamp:      epm.timestamp,
 			Attempts:       epm.nacked,
 		})
+		*/
 
 		pktBuff := *src
 		n, err := d.params.Receiver.ReadRTP(pktBuff, uint8(epm.layer), epm.sourceSeqNo)
@@ -1632,18 +1893,6 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 			if err == io.EOF {
 				break
 			}
-			// TODO-VP9-DEBUG-REMOVE-START
-			d.params.Logger.Debugw(
-				"NACK miss",
-				"isn", epm.sourceSeqNo,
-				"osn", epm.targetSeqNo,
-				"ots", epm.timestamp,
-				"eosn", epm.extSequenceNumber,
-				"eots", epm.extTimestamp,
-				"sid", epm.layer,
-				"error", err,
-			)
-			// TODO-VP9-DEBUG-REMOVE-END
 			nackMisses++
 			continue
 		}
@@ -1661,23 +1910,44 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 		pkt.Header.SequenceNumber = epm.targetSeqNo
 		pkt.Header.Timestamp = epm.timestamp
 		pkt.Header.SSRC = d.ssrc
-		pkt.Header.PayloadType = d.payloadType
+		pkt.Header.PayloadType = d.getTranslatedPayloadType(pkt.Header.PayloadType)
 
-		var payload []byte
 		poolEntity := PacketFactory.Get().(*[]byte)
-		if d.mime == "video/vp8" && len(pkt.Payload) > 0 && len(epm.codecBytes) != 0 {
-			var incomingVP8 buffer.VP8
-			if err = incomingVP8.Unmarshal(pkt.Payload); err != nil {
-				d.params.Logger.Errorw("could not unmarshal VP8 packet", err)
-				PacketFactory.Put(poolEntity)
-				continue
-			}
-
-			payload = d.translateVP8PacketTo(&pkt, &incomingVP8, epm.codecBytes, poolEntity)
+		payload := *poolEntity
+		if len(epm.codecBytesSlice) != 0 {
+			n := copy(payload, epm.codecBytesSlice)
+			m := copy(payload[n:], pkt.Payload[epm.numCodecBytesIn:])
+			payload = payload[:n+m]
+		} else {
+			copy(payload, epm.codecBytes[:epm.numCodecBytesOut])
+			copy(payload[epm.numCodecBytesOut:], pkt.Payload[epm.numCodecBytesIn:])
+			payload = payload[:int(epm.numCodecBytesOut)+len(pkt.Payload)-int(epm.numCodecBytesIn)]
 		}
-		if payload == nil {
-			payload = (*poolEntity)[:len(pkt.Payload)]
-			copy(payload, pkt.Payload)
+
+		var extensions []pacer.ExtensionData
+		if d.dependencyDescriptorExtID != 0 {
+			var ddBytes []byte
+			if len(epm.ddBytesSlice) != 0 {
+				ddBytes = epm.ddBytesSlice
+			} else {
+				ddBytes = epm.ddBytes[:epm.ddBytesSize]
+			}
+			extensions = append(
+				extensions,
+				pacer.ExtensionData{
+					ID:      uint8(d.dependencyDescriptorExtID),
+					Payload: ddBytes,
+				},
+			)
+		}
+		if d.absCaptureTimeExtID != 0 && len(epm.actBytes) != 0 {
+			extensions = append(
+				extensions,
+				pacer.ExtensionData{
+					ID:      uint8(d.absCaptureTimeExtID),
+					Payload: epm.actBytes,
+				},
+			)
 		}
 
 		d.sendingPacket(
@@ -1685,15 +1955,16 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 			len(payload),
 			&sendPacketMetadata{
 				layer:             int32(epm.layer),
-				packetTime:        time.Now(),
+				packetTime:        mono.UnixNano(),
 				extSequenceNumber: epm.extSequenceNumber,
 				extTimestamp:      epm.extTimestamp,
 				isRTX:             true,
+				isOutOfOrder:      true,
 			},
 		)
 		d.pacer.Enqueue(pacer.Packet{
 			Header:             &pkt.Header,
-			Extensions:         []pacer.ExtensionData{{ID: uint8(d.dependencyDescriptorExtID), Payload: epm.ddBytes}},
+			Extensions:         extensions,
 			Payload:            payload,
 			AbsSendTimeExtID:   uint8(d.absSendTimeExtID),
 			TransportWideExtID: uint8(d.transportWideExtID),
@@ -1706,6 +1977,7 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 	d.totalRepeatedNACKs.Add(numRepeatedNACKs)
 
 	d.rtpStats.UpdateNackProcessed(nackAcks, nackMisses, numRepeatedNACKs)
+	/* STREAM-ALLOCATOR-DATA
 	// STREAM-ALLOCATOR-EXPERIMENTAL-TODO-START
 	// Need to check on the following
 	//   - get all NACKs from sequencer even if SFU is not acknowledging,
@@ -1721,14 +1993,14 @@ func (d *DownTrack) retransmitPackets(nacks []uint16) {
 	if sal := d.getStreamAllocatorListener(); sal != nil && len(nackInfos) != 0 {
 		sal.OnNACK(d, nackInfos)
 	}
+	*/
 }
 
 func (d *DownTrack) getTranslatedRTPHeader(extPkt *buffer.ExtPacket, tp *TranslationParams) (*rtp.Header, error) {
-	tpRTP := tp.rtp
 	hdr := extPkt.Packet.Header
-	hdr.PayloadType = d.payloadType
-	hdr.Timestamp = uint32(tpRTP.extTimestamp)
-	hdr.SequenceNumber = uint16(tpRTP.extSequenceNumber)
+	hdr.PayloadType = d.getTranslatedPayloadType(hdr.PayloadType)
+	hdr.Timestamp = uint32(tp.rtp.extTimestamp)
+	hdr.SequenceNumber = uint16(tp.rtp.extSequenceNumber)
 	hdr.SSRC = d.ssrc
 	if tp.marker {
 		hdr.Marker = tp.marker
@@ -1737,14 +2009,13 @@ func (d *DownTrack) getTranslatedRTPHeader(extPkt *buffer.ExtPacket, tp *Transla
 	return &hdr, nil
 }
 
-func (d *DownTrack) translateVP8PacketTo(pkt *rtp.Packet, incomingVP8 *buffer.VP8, translatedVP8 []byte, outbuf *[]byte) []byte {
-	buf := (*outbuf)[:len(pkt.Payload)+len(translatedVP8)-incomingVP8.HeaderSize]
-	srcPayload := pkt.Payload[incomingVP8.HeaderSize:]
-	dstPayload := buf[len(translatedVP8):]
-	copy(dstPayload, srcPayload)
-
-	copy(buf[:len(translatedVP8)], translatedVP8)
-	return buf
+func (d *DownTrack) getTranslatedPayloadType(src uint8) uint8 {
+	// send primary codec to subscriber if the publisher send primary codec to us when red is negotiated,
+	// this will happen when the payload is too large to encode into red payload (exceeds mtu).
+	if d.isRED && src == d.upstreamPrimaryPT && d.primaryPT != 0 {
+		return d.primaryPT
+	}
+	return d.payloadType
 }
 
 func (d *DownTrack) DebugInfo() map[string]interface{} {
@@ -1766,7 +2037,7 @@ func (d *DownTrack) DebugInfo() map[string]interface{} {
 		"StreamID":            d.params.StreamID,
 		"SSRC":                d.ssrc,
 		"MimeType":            d.codec.MimeType,
-		"Bound":               d.bound.Load(),
+		"BindState":           d.bindState.Load().(bindState),
 		"Muted":               d.forwarder.IsMuted(),
 		"PubMuted":            d.forwarder.IsPubMuted(),
 		"CurrentSpatialLayer": d.forwarder.CurrentLayer().Spatial,
@@ -1786,7 +2057,7 @@ func (d *DownTrack) GetTrackStats() *livekit.RTPStats {
 	return d.rtpStats.ToProto()
 }
 
-func (d *DownTrack) deltaStats(ds *buffer.RTPDeltaInfo) map[uint32]*buffer.StreamStatsWithLayers {
+func (d *DownTrack) deltaStats(ds *rtpstats.RTPDeltaInfo) map[uint32]*buffer.StreamStatsWithLayers {
 	if ds == nil {
 		return nil
 	}
@@ -1794,7 +2065,7 @@ func (d *DownTrack) deltaStats(ds *buffer.RTPDeltaInfo) map[uint32]*buffer.Strea
 	streamStats := make(map[uint32]*buffer.StreamStatsWithLayers, 1)
 	streamStats[d.ssrc] = &buffer.StreamStatsWithLayers{
 		RTPStats: ds,
-		Layers: map[int32]*buffer.RTPDeltaInfo{
+		Layers: map[int32]*rtpstats.RTPDeltaInfo{
 			0: ds,
 		},
 	}
@@ -1811,25 +2082,33 @@ func (d *DownTrack) GetLastReceiverReportTime() time.Time {
 }
 
 func (d *DownTrack) GetTotalPacketsSent() uint64 {
-	return d.rtpStats.GetTotalPacketsPrimary()
+	return d.rtpStats.GetPacketsSeenMinusPadding()
 }
 
 func (d *DownTrack) GetNackStats() (totalPackets uint32, totalRepeatedNACKs uint32) {
-	totalPackets = uint32(d.rtpStats.GetTotalPacketsPrimary())
+	totalPackets = uint32(d.rtpStats.GetPacketsSeenMinusPadding())
 	totalRepeatedNACKs = d.totalRepeatedNACKs.Load()
 	return
 }
 
+/* STREAM-ALLOCATOR-DATA
 func (d *DownTrack) GetAndResetBytesSent() (uint32, uint32) {
 	return d.bytesSent.Swap(0), d.bytesRetransmitted.Swap(0)
 }
+*/
 
 func (d *DownTrack) onBindAndConnectedChange() {
-	d.writable.Store(d.connected.Load() && d.bound.Load())
-	if d.connected.Load() && d.bound.Load() && !d.bindAndConnectedOnce.Swap(true) {
+	if d.writeStopped.Load() {
+		return
+	}
+	d.writable.Store(d.connected.Load() && d.bindState.Load() == bindStateBound)
+	if d.connected.Load() && d.bindState.Load() == bindStateBound && !d.bindAndConnectedOnce.Swap(true) {
 		if d.activePaddingOnMuteUpTrack.Load() {
 			go d.sendPaddingOnMute()
 		}
+
+		// kick off PLI request if allocation is pending
+		d.postKeyFrameRequestEvent()
 	}
 }
 
@@ -1839,7 +2118,7 @@ func (d *DownTrack) sendPaddingOnMute() {
 
 	if d.kind == webrtc.RTPCodecTypeVideo {
 		d.sendPaddingOnMuteForVideo()
-	} else if d.mime == "audio/opus" {
+	} else if d.mime == strings.ToLower(webrtc.MimeTypeOpus) {
 		d.sendSilentFrameOnMuteForOpus()
 	}
 }
@@ -1899,7 +2178,7 @@ func (d *DownTrack) sendSilentFrameOnMuteForOpus() {
 				&hdr,
 				len(payload),
 				&sendPacketMetadata{
-					packetTime:        time.Now(),
+					packetTime:        mono.UnixNano(),
 					extSequenceNumber: snts[i].extSequenceNumber,
 					extTimestamp:      snts[i].extTimestamp,
 					// although this is using empty frames, mark as padding as these are used to trigger Pion OnTrack only
@@ -1924,26 +2203,29 @@ func (d *DownTrack) HandleRTCPSenderReportData(
 	_payloadType webrtc.PayloadType,
 	isSVC bool,
 	layer int32,
-	srFirst *buffer.RTCPSenderReportData,
-	srNewest *buffer.RTCPSenderReportData,
+	publisherSRData *livekit.RTCPSenderReportState,
 ) error {
-	if (layer == d.forwarder.GetReferenceLayerSpatial() || (layer == 0 && isSVC)) && srNewest != nil {
-		d.rtpStats.MaybeAdjustFirstPacketTime(
-			srFirst,
-			srNewest,
-			srNewest.RTPTimestamp+uint32(d.forwarder.GetReferenceTimestampOffset()),
-		)
+	d.forwarder.SetRefSenderReport(isSVC, layer, publisherSRData)
+
+	currentLayer, tsOffset, refSenderReport := d.forwarder.GetSenderReportParams()
+	if layer == currentLayer || (layer == 0 && isSVC) {
+		d.handleRTCPSenderReportData(refSenderReport, tsOffset)
 	}
 	return nil
 }
 
+func (d *DownTrack) handleRTCPSenderReportData(publisherSRData *livekit.RTCPSenderReportState, tsOffset uint64) {
+	d.rtpStats.MaybeAdjustFirstPacketTime(publisherSRData, tsOffset)
+}
+
 type sendPacketMetadata struct {
 	layer                int32
-	packetTime           time.Time
+	packetTime           int64
 	extSequenceNumber    uint64
 	extTimestamp         uint64
 	isKeyFrame           bool
 	isRTX                bool
+	isOutOfOrder         bool
 	isPadding            bool
 	shouldDisableCounter bool
 	tp                   *TranslationParams
@@ -1955,19 +2237,23 @@ func (d *DownTrack) sendingPacket(hdr *rtp.Header, payloadSize int, spmd *sendPa
 		// STREAM-ALLOCATOR-TODO: remove this stream allocator bytes counter once stream allocator changes fully to pull bytes counter
 		size := uint32(hdrSize + payloadSize)
 		d.streamAllocatorBytesCounter.Add(size)
+		/* STREAM-ALLOCATOR-DATA
 		if spmd.isRTX {
 			d.bytesRetransmitted.Add(size)
 		} else {
 			d.bytesSent.Add(size)
 		}
+		*/
 	}
 
 	// update RTPStats
+	paddingSize := payloadSize
 	if spmd.isPadding {
-		d.rtpStats.Update(spmd.packetTime, spmd.extSequenceNumber, spmd.extTimestamp, hdr.Marker, hdrSize, 0, payloadSize)
+		payloadSize = 0
 	} else {
-		d.rtpStats.Update(spmd.packetTime, spmd.extSequenceNumber, spmd.extTimestamp, hdr.Marker, hdrSize, payloadSize, 0)
+		paddingSize = 0
 	}
+	d.rtpStats.Update(spmd.packetTime, spmd.extSequenceNumber, spmd.extTimestamp, hdr.Marker, hdrSize, payloadSize, paddingSize, spmd.isOutOfOrder)
 
 	if spmd.isKeyFrame {
 		d.isNACKThrottled.Store(false)
@@ -1982,7 +2268,7 @@ func (d *DownTrack) sendingPacket(hdr *rtp.Header, payloadSize int, spmd *sendPa
 
 	if spmd.tp != nil {
 		if spmd.tp.isSwitching {
-			d.postMaxLayerNotifierEvent()
+			d.postMaxLayerNotifierEvent("switching")
 		}
 
 		if spmd.tp.isResuming {

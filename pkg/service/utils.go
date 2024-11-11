@@ -15,9 +15,12 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
 
 	"github.com/livekit/protocol/logger"
 )
@@ -27,13 +30,22 @@ func handleError(w http.ResponseWriter, r *http.Request, status int, err error, 
 	if r != nil && r.URL != nil {
 		keysAndValues = append(keysAndValues, "method", r.Method, "path", r.URL.Path)
 	}
-	logger.GetLogger().WithCallDepth(1).Warnw("error handling request", err, keysAndValues...)
+	if !errors.Is(err, context.Canceled) {
+		logger.GetLogger().WithCallDepth(1).Warnw("error handling request", err, keysAndValues...)
+	}
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(err.Error()))
 }
 
 func boolValue(s string) bool {
 	return s == "1" || s == "true"
+}
+
+func RemoveDoubleSlashes(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
+	if strings.HasPrefix(r.URL.Path, "//") {
+		r.URL.Path = r.URL.Path[1:]
+	}
+	next(w, r)
 }
 
 func IsValidDomain(domain string) bool {

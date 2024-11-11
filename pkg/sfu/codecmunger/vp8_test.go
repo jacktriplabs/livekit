@@ -195,10 +195,11 @@ func TestOutOfOrderPictureId(t *testing.T) {
 	vp8.PictureID = 13466
 	extPkt, _ = testutils.GetTestExtPacketVP8(params, vp8)
 
-	codecBytes, err := v.UpdateAndGet(extPkt, true, false, 2)
+	nIn, buf, err := v.UpdateAndGet(extPkt, true, false, 2)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrOutOfOrderVP8PictureIdCacheMiss)
-	require.Nil(t, codecBytes)
+	require.Equal(t, 0, nIn)
+	require.Nil(t, buf)
 
 	// create a hole in picture id
 	vp8.PictureID = 13469
@@ -221,9 +222,10 @@ func TestOutOfOrderPictureId(t *testing.T) {
 	}
 	marshalledVP8, err := expectedVP8.Marshal()
 	require.NoError(t, err)
-	codecBytes, err = v.UpdateAndGet(extPkt, false, true, 2)
+	nIn, buf, err = v.UpdateAndGet(extPkt, false, true, 2)
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, codecBytes)
+	require.Equal(t, 6, nIn)
+	require.Equal(t, marshalledVP8, buf)
 
 	// all three, the last, the current and the in-between should have been added to missing picture id cache
 	value, ok := v.PictureIdOffset(13467)
@@ -259,9 +261,10 @@ func TestOutOfOrderPictureId(t *testing.T) {
 	}
 	marshalledVP8, err = expectedVP8.Marshal()
 	require.NoError(t, err)
-	codecBytes, err = v.UpdateAndGet(extPkt, true, false, 2)
+	nIn, buf, err = v.UpdateAndGet(extPkt, true, false, 2)
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, codecBytes)
+	require.Equal(t, 6, nIn)
+	require.Equal(t, marshalledVP8, buf)
 }
 
 func TestTemporalLayerFiltering(t *testing.T) {
@@ -291,10 +294,11 @@ func TestTemporalLayerFiltering(t *testing.T) {
 	v.SetLast(extPkt)
 
 	// translate
-	tp, err := v.UpdateAndGet(extPkt, false, false, 0)
+	nIn, buf, err := v.UpdateAndGet(extPkt, false, false, 0)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrFilteredVP8TemporalLayer)
-	require.Nil(t, tp)
+	require.Equal(t, 0, nIn)
+	require.Nil(t, buf)
 	dropped, _ := v.droppedPictureIds.Get(13467)
 	require.True(t, dropped)
 	require.EqualValues(t, 1, v.pictureIdOffset)
@@ -304,10 +308,11 @@ func TestTemporalLayerFiltering(t *testing.T) {
 	params.SequenceNumber = 23334
 	extPkt, _ = testutils.GetTestExtPacketVP8(params, vp8)
 
-	tp, err = v.UpdateAndGet(extPkt, false, false, 0)
+	nIn, buf, err = v.UpdateAndGet(extPkt, false, false, 0)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrFilteredVP8TemporalLayer)
-	require.Nil(t, tp)
+	require.Equal(t, 0, nIn)
+	require.Nil(t, buf)
 	dropped, _ = v.droppedPictureIds.Get(13467)
 	require.True(t, dropped)
 	require.EqualValues(t, 1, v.pictureIdOffset)
@@ -317,10 +322,11 @@ func TestTemporalLayerFiltering(t *testing.T) {
 	params.SequenceNumber = 23337
 	extPkt, _ = testutils.GetTestExtPacketVP8(params, vp8)
 
-	tp, err = v.UpdateAndGet(extPkt, false, false, 0)
+	nIn, buf, err = v.UpdateAndGet(extPkt, false, false, 0)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrFilteredVP8TemporalLayer)
-	require.Nil(t, tp)
+	require.Equal(t, 0, nIn)
+	require.Nil(t, buf)
 	dropped, _ = v.droppedPictureIds.Get(13467)
 	require.True(t, dropped)
 	require.EqualValues(t, 1, v.pictureIdOffset)
@@ -370,9 +376,10 @@ func TestGapInSequenceNumberSamePicture(t *testing.T) {
 	}
 	marshalledVP8, err := expectedVP8.Marshal()
 	require.NoError(t, err)
-	codecBytes, err := v.UpdateAndGet(extPkt, false, false, 2)
+	nIn, buf, err := v.UpdateAndGet(extPkt, false, false, 2)
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, codecBytes)
+	require.Equal(t, 6, nIn)
+	require.Equal(t, marshalledVP8, buf)
 
 	// telling there is a gap in sequence number will add pictures to missing picture cache
 	expectedVP8 = &buffer.VP8{
@@ -392,9 +399,10 @@ func TestGapInSequenceNumberSamePicture(t *testing.T) {
 	}
 	marshalledVP8, err = expectedVP8.Marshal()
 	require.NoError(t, err)
-	codecBytes, err = v.UpdateAndGet(extPkt, false, true, 2)
+	nIn, buf, err = v.UpdateAndGet(extPkt, false, true, 2)
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, codecBytes)
+	require.Equal(t, 6, nIn)
+	require.Equal(t, marshalledVP8, buf)
 
 	value, ok := v.PictureIdOffset(13467)
 	require.True(t, ok)
@@ -430,7 +438,7 @@ func TestUpdateAndGetPadding(t *testing.T) {
 	v.SetLast(extPkt)
 
 	// getting padding with repeat of last picture
-	blankBytes, err := v.UpdateAndGetPadding(false)
+	buf, err := v.UpdateAndGetPadding(false)
 	require.NoError(t, err)
 	expectedVP8 := buffer.VP8{
 		FirstByte:  16,
@@ -449,10 +457,10 @@ func TestUpdateAndGetPadding(t *testing.T) {
 	}
 	marshalledVP8, err := expectedVP8.Marshal()
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, blankBytes)
+	require.Equal(t, marshalledVP8, buf)
 
 	// getting padding with new picture
-	blankBytes, err = v.UpdateAndGetPadding(true)
+	buf, err = v.UpdateAndGetPadding(true)
 	require.NoError(t, err)
 	expectedVP8 = buffer.VP8{
 		FirstByte:  16,
@@ -471,7 +479,7 @@ func TestUpdateAndGetPadding(t *testing.T) {
 	}
 	marshalledVP8, err = expectedVP8.Marshal()
 	require.NoError(t, err)
-	require.Equal(t, marshalledVP8, blankBytes)
+	require.Equal(t, marshalledVP8, buf)
 }
 
 func TestVP8PictureIdWrapHandler(t *testing.T) {

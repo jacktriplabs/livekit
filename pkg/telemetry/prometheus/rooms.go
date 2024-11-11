@@ -45,20 +45,22 @@ var (
 	promTrackPublishCounter    *prometheus.CounterVec
 	promTrackSubscribeCounter  *prometheus.CounterVec
 	promSessionStartTime       *prometheus.HistogramVec
+	promSessionDuration        *prometheus.HistogramVec
+	promPubSubTime             *prometheus.HistogramVec
 )
 
-func initRoomStats(nodeID string, nodeType livekit.NodeType, env string) {
+func initRoomStats(nodeID string, nodeType livekit.NodeType) {
 	promRoomCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "room",
 		Name:        "total",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	})
 	promRoomDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "room",
 		Name:        "duration_seconds",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 		Buckets: []float64{
 			5, 10, 60, 5 * 60, 10 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 5 * 60 * 60, 10 * 60 * 60,
 		},
@@ -67,39 +69,53 @@ func initRoomStats(nodeID string, nodeType livekit.NodeType, env string) {
 		Namespace:   livekitNamespace,
 		Subsystem:   "participant",
 		Name:        "total",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	})
 	promTrackPublishedCurrent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "track",
 		Name:        "published_total",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	}, []string{"kind"})
 	promTrackSubscribedCurrent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "track",
 		Name:        "subscribed_total",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	}, []string{"kind"})
 	promTrackPublishCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "track",
 		Name:        "publish_counter",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	}, []string{"kind", "state"})
 	promTrackSubscribeCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "track",
 		Name:        "subscribe_counter",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 	}, []string{"state", "error"})
 	promSessionStartTime = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace:   livekitNamespace,
 		Subsystem:   "session",
 		Name:        "start_time_ms",
-		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String(), "env": env},
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
 		Buckets:     prometheus.ExponentialBucketsRange(100, 10000, 15),
 	}, []string{"protocol_version"})
+	promSessionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace:   livekitNamespace,
+		Subsystem:   "session",
+		Name:        "duration_ms",
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
+		Buckets:     prometheus.ExponentialBucketsRange(100, 4*60*60*1000, 15),
+	}, []string{"protocol_version"})
+	promPubSubTime = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace:   livekitNamespace,
+		Subsystem:   "pubsubtime",
+		Name:        "ms",
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
+		Buckets:     []float64{100, 200, 500, 700, 1000, 5000, 10000},
+	}, append(promStreamLabels, "sdk", "kind", "count"))
 
 	prometheus.MustRegister(promRoomCurrent)
 	prometheus.MustRegister(promRoomDuration)
@@ -109,6 +125,8 @@ func initRoomStats(nodeID string, nodeType livekit.NodeType, env string) {
 	prometheus.MustRegister(promTrackPublishCounter)
 	prometheus.MustRegister(promTrackSubscribeCounter)
 	prometheus.MustRegister(promSessionStartTime)
+	prometheus.MustRegister(promSessionDuration)
+	prometheus.MustRegister(promPubSubTime)
 }
 
 func RoomStarted() {
@@ -154,6 +172,22 @@ func AddPublishSuccess(kind string) {
 	promTrackPublishCounter.WithLabelValues(kind, "success").Inc()
 }
 
+func RecordPublishTime(source livekit.TrackSource, trackType livekit.TrackType, d time.Duration, sdk livekit.ClientInfo_SDK, kind livekit.ParticipantInfo_Kind) {
+	recordPubSubTime(true, source, trackType, d, sdk, kind, 1)
+}
+
+func RecordSubscribeTime(source livekit.TrackSource, trackType livekit.TrackType, d time.Duration, sdk livekit.ClientInfo_SDK, kind livekit.ParticipantInfo_Kind, count int) {
+	recordPubSubTime(false, source, trackType, d, sdk, kind, count)
+}
+
+func recordPubSubTime(isPublish bool, source livekit.TrackSource, trackType livekit.TrackType, d time.Duration, sdk livekit.ClientInfo_SDK, kind livekit.ParticipantInfo_Kind, count int) {
+	direction := "subscribe"
+	if isPublish {
+		direction = "publish"
+	}
+	promPubSubTime.WithLabelValues(direction, source.String(), trackType.String(), sdk.String(), kind.String(), strconv.Itoa(count)).Observe(float64(d.Milliseconds()))
+}
+
 func RecordTrackSubscribeSuccess(kind string) {
 	// modify both current and total counters
 	promTrackSubscribedCurrent.WithLabelValues(kind).Add(1)
@@ -185,4 +219,8 @@ func RecordTrackSubscribeFailure(err error, isUserError bool) {
 
 func RecordSessionStartTime(protocolVersion int, d time.Duration) {
 	promSessionStartTime.WithLabelValues(strconv.Itoa(protocolVersion)).Observe(float64(d.Milliseconds()))
+}
+
+func RecordSessionDuration(protocolVersion int, d time.Duration) {
+	promSessionDuration.WithLabelValues(strconv.Itoa(protocolVersion)).Observe(float64(d.Milliseconds()))
 }

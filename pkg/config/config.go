@@ -27,7 +27,9 @@ import (
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
 
+	"github.com/livekit/livekit-server/pkg/metric"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	redisLiveKit "github.com/livekit/protocol/redis"
 	"github.com/livekit/protocol/rpc"
@@ -47,8 +49,9 @@ const (
 	StreamTrackerTypePacket StreamTrackerType = "packet"
 	StreamTrackerTypeFrame  StreamTrackerType = "frame"
 
-	StatsUpdateInterval          = time.Second * 10
-	TelemetryStatsUpdateInterval = time.Second * 30
+	StatsUpdateInterval                  = time.Second * 10
+	TelemetryStatsUpdateInterval         = time.Second * 30
+	TelemetryNonMediaStatsUpdateInterval = time.Minute * 5
 )
 
 var (
@@ -57,10 +60,11 @@ var (
 )
 
 type Config struct {
-	Port           uint32                   `yaml:"port,omitempty"`
-	BindAddresses  []string                 `yaml:"bind_addresses,omitempty"`
+	Port          uint32   `yaml:"port,omitempty"`
+	BindAddresses []string `yaml:"bind_addresses,omitempty"`
+	// PrometheusPort is deprecated
 	PrometheusPort uint32                   `yaml:"prometheus_port,omitempty"`
-	Environment    string                   `yaml:"environment,omitempty"`
+	Prometheus     PrometheusConfig         `yaml:"prometheus,omitempty"`
 	RTC            RTCConfig                `yaml:"rtc,omitempty"`
 	Redis          redisLiveKit.RedisConfig `yaml:"redis,omitempty"`
 	Audio          AudioConfig              `yaml:"audio,omitempty"`
@@ -76,12 +80,14 @@ type Config struct {
 	Region         string                   `yaml:"region,omitempty"`
 	SignalRelay    SignalRelayConfig        `yaml:"signal_relay,omitempty"`
 	PSRPC          rpc.PSRPCConfig          `yaml:"psrpc,omitempty"`
-	// LogLevel is deprecated
+	// Deprecated: LogLevel is deprecated
 	LogLevel string        `yaml:"log_level,omitempty"`
 	Logging  LoggingConfig `yaml:"logging,omitempty"`
 	Limit    LimitConfig   `yaml:"limit,omitempty"`
 
 	Development bool `yaml:"development,omitempty"`
+
+	Metric metric.MetricConfig `yaml:"metric,omitempty"`
 }
 
 type RTCConfig struct {
@@ -91,8 +97,12 @@ type RTCConfig struct {
 
 	StrictACKs bool `yaml:"strict_acks,omitempty"`
 
-	// Number of packets to buffer for NACK
+	// Deprecated: use PacketBufferSizeVideo and PacketBufferSizeAudio
 	PacketBufferSize int `yaml:"packet_buffer_size,omitempty"`
+	// Number of packets to buffer for NACK - video
+	PacketBufferSizeVideo int `yaml:"packet_buffer_size_video,omitempty"`
+	// Number of packets to buffer for NACK - audio
+	PacketBufferSizeAudio int `yaml:"packet_buffer_size_audio,omitempty"`
 
 	// Throttle periods for pli/fir rtcp packets
 	PLIThrottle PLIThrottleConfig `yaml:"pli_throttle,omitempty"`
@@ -113,6 +123,8 @@ type RTCConfig struct {
 
 	// max number of bytes to buffer for data channel. 0 means unlimited
 	DataChannelMaxBufferedAmount uint64 `yaml:"data_channel_max_buffered_amount,omitempty"`
+
+	ForwardStats ForwardStatsConfig `yaml:"forward_stats,omitempty"`
 }
 
 type TURNServer struct {
@@ -186,6 +198,8 @@ type AudioConfig struct {
 	SmoothIntervals uint32 `yaml:"smooth_intervals,omitempty"`
 	// enable red encoding downtrack for opus only audio up track
 	ActiveREDEncoding bool `yaml:"active_red_encoding,omitempty"`
+	// enable proxying weakest subscriber loss to publisher in RTCP Receiver Report
+	EnableLossProxying bool `yaml:"enable_loss_proxying,omitempty"`
 }
 
 type StreamTrackerPacketConfig struct {
@@ -227,10 +241,20 @@ type RoomConfig struct {
 	EnabledCodecs      []CodecSpec        `yaml:"enabled_codecs,omitempty"`
 	MaxParticipants    uint32             `yaml:"max_participants,omitempty"`
 	EmptyTimeout       uint32             `yaml:"empty_timeout,omitempty"`
+	DepartureTimeout   uint32             `yaml:"departure_timeout,omitempty"`
 	EnableRemoteUnmute bool               `yaml:"enable_remote_unmute,omitempty"`
-	MaxMetadataSize    uint32             `yaml:"max_metadata_size,omitempty"`
 	PlayoutDelay       PlayoutDelayConfig `yaml:"playout_delay,omitempty"`
 	SyncStreams        bool               `yaml:"sync_streams,omitempty"`
+	CreateRoomEnabled  bool               `yaml:"create_room_enabled,omitempty"`
+	CreateRoomTimeout  time.Duration      `yaml:"create_room_timeout,omitempty"`
+	CreateRoomAttempts int                `yaml:"create_room_attempts,omitempty"`
+	// deprecated, moved to limits
+	MaxMetadataSize uint32 `yaml:"max_metadata_size,omitempty"`
+	// deprecated, moved to limits
+	MaxRoomNameLength int `yaml:"max_room_name_length,omitempty"`
+	// deprecated, moved to limits
+	MaxParticipantIdentityLength int                                  `yaml:"max_participant_identity_length,omitempty"`
+	RoomConfigurations           map[string]livekit.RoomConfiguration `yaml:"room_configurations,omitempty"`
 }
 
 type CodecSpec struct {
@@ -274,6 +298,7 @@ type SignalRelayConfig struct {
 	MinRetryInterval time.Duration `yaml:"min_retry_interval,omitempty"`
 	MaxRetryInterval time.Duration `yaml:"max_retry_interval,omitempty"`
 	StreamBufferSize int           `yaml:"stream_buffer_size,omitempty"`
+	ConnectAttempts  int           `yaml:"connect_attempts,omitempty"`
 }
 
 // RegionConfig lists available regions and their latitude/longitude, so the selector would prefer
@@ -289,6 +314,36 @@ type LimitConfig struct {
 	BytesPerSec            float32 `yaml:"bytes_per_sec,omitempty"`
 	SubscriptionLimitVideo int32   `yaml:"subscription_limit_video,omitempty"`
 	SubscriptionLimitAudio int32   `yaml:"subscription_limit_audio,omitempty"`
+	MaxMetadataSize        uint32  `yaml:"max_metadata_size,omitempty"`
+	// total size of all attributes on a participant
+	MaxAttributesSize            uint32 `yaml:"max_attributes_size,omitempty"`
+	MaxRoomNameLength            int    `yaml:"max_room_name_length,omitempty"`
+	MaxParticipantIdentityLength int    `yaml:"max_participant_identity_length,omitempty"`
+	MaxParticipantNameLength     int    `yaml:"max_participant_name_length,omitempty"`
+}
+
+func (l LimitConfig) CheckRoomNameLength(name string) bool {
+	return l.MaxRoomNameLength == 0 || len(name) <= l.MaxRoomNameLength
+}
+
+func (l LimitConfig) CheckParticipantNameLength(name string) bool {
+	return l.MaxParticipantNameLength == 0 || len(name) <= l.MaxParticipantNameLength
+}
+
+func (l LimitConfig) CheckMetadataSize(metadata string) bool {
+	return l.MaxMetadataSize == 0 || uint32(len(metadata)) <= l.MaxMetadataSize
+}
+
+func (l LimitConfig) CheckAttributesSize(attributes map[string]string) bool {
+	if l.MaxAttributesSize == 0 {
+		return true
+	}
+
+	total := 0
+	for k, v := range attributes {
+		total += len(k) + len(v)
+	}
+	return uint32(total) <= l.MaxAttributesSize
 }
 
 type IngressConfig struct {
@@ -309,6 +364,18 @@ type APIConfig struct {
 	MaxCheckInterval time.Duration `yaml:"max_check_interval,omitempty"`
 }
 
+type PrometheusConfig struct {
+	Port     uint32 `yaml:"port,omitempty"`
+	Username string `yaml:"username,omitempty"`
+	Password string `yaml:"password,omitempty"`
+}
+
+type ForwardStatsConfig struct {
+	SummaryInterval time.Duration `yaml:"summary_interval,omitempty"`
+	ReportInterval  time.Duration `yaml:"report_interval,omitempty"`
+	ReportWindow    time.Duration `yaml:"report_window,omitempty"`
+}
+
 func DefaultAPIConfig() APIConfig {
 	return APIConfig{
 		ExecutionTimeout: 2 * time.Second,
@@ -327,8 +394,10 @@ var DefaultConfig = Config{
 			ICEPortRangeEnd:   0,
 			STUNServers:       []string{},
 		},
-		PacketBufferSize: 500,
-		StrictACKs:       true,
+		PacketBufferSize:      500,
+		PacketBufferSizeVideo: 500,
+		PacketBufferSizeAudio: 200,
+		StrictACKs:            true,
 		PLIThrottle: PLIThrottleConfig{
 			LowQuality:  500 * time.Millisecond,
 			MidQuality:  time.Second,
@@ -475,7 +544,18 @@ var DefaultConfig = Config{
 			{Mime: webrtc.MimeTypeVP9},
 			{Mime: webrtc.MimeTypeAV1},
 		},
-		EmptyTimeout: 5 * 60,
+		EmptyTimeout:       5 * 60,
+		DepartureTimeout:   20,
+		CreateRoomEnabled:  true,
+		CreateRoomTimeout:  10 * time.Second,
+		CreateRoomAttempts: 3,
+	},
+	Limit: LimitConfig{
+		MaxMetadataSize:              64000,
+		MaxAttributesSize:            64000,
+		MaxRoomNameLength:            256,
+		MaxParticipantIdentityLength: 256,
+		MaxParticipantNameLength:     256,
 	},
 	Logging: LoggingConfig{
 		PionLevel: "error",
@@ -494,9 +574,11 @@ var DefaultConfig = Config{
 		MinRetryInterval: 500 * time.Millisecond,
 		MaxRetryInterval: 4 * time.Second,
 		StreamBufferSize: 1000,
+		ConnectAttempts:  3,
 	},
-	PSRPC: rpc.DefaultPSRPCConfig,
-	Keys:  map[string]string{},
+	PSRPC:  rpc.DefaultPSRPCConfig,
+	Keys:   map[string]string{},
+	Metric: metric.DefaultMetricConfig,
 }
 
 func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []cli.Flag) (*Config, error) {
@@ -563,8 +645,15 @@ func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []c
 		conf.Logging.ComponentLevels["pion"] = conf.Logging.PionLevel
 	}
 
-	if conf.Development {
-		conf.Environment = "dev"
+	// copy over legacy limits
+	if conf.Room.MaxMetadataSize != 0 {
+		conf.Limit.MaxMetadataSize = conf.Room.MaxMetadataSize
+	}
+	if conf.Room.MaxParticipantIdentityLength != 0 {
+		conf.Limit.MaxParticipantIdentityLength = conf.Room.MaxParticipantIdentityLength
+	}
+	if conf.Room.MaxRoomNameLength != 0 {
+		conf.Limit.MaxRoomNameLength = conf.Room.MaxRoomNameLength
 	}
 
 	return &conf, nil

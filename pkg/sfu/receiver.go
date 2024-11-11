@@ -24,18 +24,18 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/mediatransportutil/pkg/bucket"
-	"github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/sfu/audio"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
-	dd "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
+	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
+	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 )
 
 var (
@@ -57,7 +57,7 @@ type TrackReceiver interface {
 	HeaderExtensions() []webrtc.RTPHeaderExtensionParameter
 	IsClosed() bool
 
-	ReadRTP(buf []byte, layer uint8, sn uint16) (int, error)
+	ReadRTP(buf []byte, layer uint8, esn uint64) (int, error)
 	GetLayeredBitrate() ([]int32, Bitrates)
 
 	GetAudioLevel() (float64, bool)
@@ -83,10 +83,11 @@ type TrackReceiver interface {
 
 	GetTemporalLayerFpsForSpatial(layer int32) []float32
 
-	GetCalculatedClockRate(layer int32) uint32
-	GetReferenceLayerRTPTimestamp(ts uint32, layer int32, referenceLayer int32) (uint32, error)
-
 	GetTrackStats() *livekit.RTPStats
+
+	// AddOnReady adds a function to be called when the receiver is ready, the callback
+	// could be called immediately if the receiver is ready when the callback is added
+	AddOnReady(func())
 }
 
 // WebRTCReceiver receives a media track
@@ -111,8 +112,6 @@ type WebRTCReceiver struct {
 
 	onRTCP func([]rtcp.Packet)
 
-	twcc *twcc.Responder
-
 	bufferMu sync.RWMutex
 	buffers  [buffer.DefaultMaxLayerSpatial + 1]*buffer.Buffer
 	upTracks [buffer.DefaultMaxLayerSpatial + 1]*webrtc.TrackRemote
@@ -131,25 +130,9 @@ type WebRTCReceiver struct {
 
 	primaryReceiver atomic.Pointer[RedPrimaryReceiver]
 	redReceiver     atomic.Pointer[RedReceiver]
-	redPktWriter    func(pkt *buffer.ExtPacket, spatialLayer int32)
-}
+	redPktWriter    func(pkt *buffer.ExtPacket, spatialLayer int32) int
 
-// SVC-TODO: Have to use more conditions to differentiate between
-// SVC-TODO: SVC and non-SVC (could be single layer or simulcast).
-// SVC-TODO: May only need to differentiate between simulcast and non-simulcast
-// SVC-TODO: i. e. may be possible to treat single layer as SVC to get proper/intended functionality.
-func IsSvcCodec(mime string) bool {
-	switch strings.ToLower(mime) {
-	case "video/av1":
-		fallthrough
-	case "video/vp9":
-		return true
-	}
-	return false
-}
-
-func IsRedCodec(mime string) bool {
-	return strings.HasSuffix(strings.ToLower(mime), "red")
+	forwardStats *ForwardStats
 }
 
 type ReceiverOpts func(w *WebRTCReceiver) *WebRTCReceiver
@@ -190,6 +173,13 @@ func WithLoadBalanceThreshold(downTracks int) ReceiverOpts {
 	}
 }
 
+func WithForwardStats(forwardStats *ForwardStats) ReceiverOpts {
+	return func(w *WebRTCReceiver) *WebRTCReceiver {
+		w.forwardStats = forwardStats
+		return w
+	}
+}
+
 // NewWebRTCReceiver creates a new webrtc track receiver
 func NewWebRTCReceiver(
 	receiver *webrtc.RTPReceiver,
@@ -208,14 +198,14 @@ func NewWebRTCReceiver(
 		codec:    track.Codec(),
 		kind:     track.Kind(),
 		onRTCP:   onRTCP,
-		isSVC:    IsSvcCodec(track.Codec().MimeType),
-		isRED:    IsRedCodec(track.Codec().MimeType),
+		isSVC:    buffer.IsSvcCodec(track.Codec().MimeType),
+		isRED:    buffer.IsRedCodec(track.Codec().MimeType),
 	}
 
 	for _, opt := range opts {
 		w = opt(w)
 	}
-	w.trackInfo.Store(proto.Clone(trackInfo).(*livekit.TrackInfo))
+	w.trackInfo.Store(utils.CloneProto(trackInfo))
 
 	w.downTrackSpreader = NewDownTrackSpreader(DownTrackSpreaderParams{
 		Threshold: w.lbThreshold,
@@ -223,8 +213,6 @@ func NewWebRTCReceiver(
 	})
 
 	w.connectionStats = connectionquality.NewConnectionStats(connectionquality.ConnectionStatsParams{
-		MimeType:         w.codec.MimeType,
-		IsFECEnabled:     strings.EqualFold(w.codec.MimeType, webrtc.MimeTypeOpus) && strings.Contains(strings.ToLower(w.codec.SDPFmtpLine), "fec"),
 		ReceiverProvider: w,
 		Logger:           w.logger.WithValues("direction", "up"),
 	})
@@ -233,7 +221,11 @@ func NewWebRTCReceiver(
 			w.onStatsUpdate(w, stat)
 		}
 	})
-	w.connectionStats.Start(trackInfo)
+	w.connectionStats.Start(
+		w.codec.MimeType,
+		// TODO: technically not correct to declare FEC on when RED. Need the primary codec's fmtp line to check.
+		strings.EqualFold(w.codec.MimeType, MimeTypeAudioRed) || strings.Contains(strings.ToLower(w.codec.SDPFmtpLine), "useinbandfec=1"),
+	)
 
 	w.streamTrackerManager = NewStreamTrackerManager(logger, trackInfo, w.isSVC, w.codec.ClockRate, trackersConfig)
 	w.streamTrackerManager.SetListener(w)
@@ -255,7 +247,7 @@ func (w *WebRTCReceiver) TrackInfo() *livekit.TrackInfo {
 }
 
 func (w *WebRTCReceiver) UpdateTrackInfo(ti *livekit.TrackInfo) {
-	w.trackInfo.Store(proto.Clone(ti).(*livekit.TrackInfo))
+	w.trackInfo.Store(utils.CloneProto(ti))
 	w.streamTrackerManager.UpdateTrackInfo(ti)
 }
 
@@ -347,13 +339,12 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 		ObserveDuration: w.audioConfig.UpdateInterval,
 		SmoothIntervals: w.audioConfig.SmoothIntervals,
 	})
+	buff.SetAudioLossProxying(w.audioConfig.EnableLossProxying)
 	buff.OnRtcpFeedback(w.sendRTCP)
 	buff.OnRtcpSenderReport(func() {
-		srFirst, srNewest := buff.GetSenderReportData()
-		w.streamTrackerManager.SetRTCPSenderReportData(layer, srFirst, srNewest)
-
+		srData := buff.GetSenderReportData()
 		w.downTrackSpreader.Broadcast(func(dt TrackSender) {
-			_ = dt.HandleRTCPSenderReportData(w.codec.PayloadType, w.isSVC, layer, srFirst, srNewest)
+			_ = dt.HandleRTCPSenderReportData(w.codec.PayloadType, w.isSVC, layer, srData)
 		})
 	})
 
@@ -421,7 +412,6 @@ func (w *WebRTCReceiver) AddDownTrack(track TrackSender) error {
 		w.logger.Infow("subscriberID already exists, replacing downtrack", "subscriberID", track.SubscriberID())
 	}
 
-	track.TrackInfoAvailable()
 	track.UpTrackMaxPublishedLayerChange(w.streamTrackerManager.GetMaxPublishedLayer())
 	track.UpTrackMaxTemporalLayerSeenChange(w.streamTrackerManager.GetMaxTemporalLayerSeen())
 
@@ -430,8 +420,31 @@ func (w *WebRTCReceiver) AddDownTrack(track TrackSender) error {
 	return nil
 }
 
+func (w *WebRTCReceiver) notifyMaxExpectedLayer(layer int32) {
+	ti := w.TrackInfo()
+	if ti == nil {
+		return
+	}
+
+	if w.Kind() == webrtc.RTPCodecTypeAudio || ti.Source == livekit.TrackSource_SCREEN_SHARE {
+		// screen share tracks have highly variable bitrate, do not use bit rate based quality for those
+		return
+	}
+
+	expectedBitrate := int64(0)
+	for _, vl := range ti.Layers {
+		l := buffer.VideoQualityToSpatialLayer(vl.Quality, ti)
+		if l <= layer {
+			expectedBitrate += int64(vl.Bitrate)
+		}
+	}
+
+	w.connectionStats.AddBitrateTransition(expectedBitrate)
+}
+
 func (w *WebRTCReceiver) SetMaxExpectedSpatialLayer(layer int32) {
 	w.streamTrackerManager.SetMaxExpectedSpatialLayer(layer)
+	w.notifyMaxExpectedLayer(layer)
 
 	if layer == buffer.InvalidLayerSpatial {
 		w.connectionStats.UpdateLayerMute(true)
@@ -463,6 +476,7 @@ func (w *WebRTCReceiver) OnMaxPublishedLayerChanged(maxPublishedLayer int32) {
 		dt.UpTrackMaxPublishedLayerChange(maxPublishedLayer)
 	})
 
+	w.notifyMaxExpectedLayer(maxPublishedLayer)
 	w.connectionStats.AddLayerTransition(w.streamTrackerManager.DistanceToDesired())
 }
 
@@ -551,13 +565,13 @@ func (w *WebRTCReceiver) getBufferLocked(layer int32) *buffer.Buffer {
 	return w.buffers[layer]
 }
 
-func (w *WebRTCReceiver) ReadRTP(buf []byte, layer uint8, sn uint16) (int, error) {
+func (w *WebRTCReceiver) ReadRTP(buf []byte, layer uint8, esn uint64) (int, error) {
 	b := w.getBuffer(int32(layer))
 	if b == nil {
 		return 0, ErrBufferNotFound
 	}
 
-	return b.GetPacket(buf, sn)
+	return b.GetPacket(buf, esn)
 }
 
 func (w *WebRTCReceiver) GetTrackStats() *livekit.RTPStats {
@@ -578,7 +592,7 @@ func (w *WebRTCReceiver) GetTrackStats() *livekit.RTPStats {
 		stats = append(stats, sswl)
 	}
 
-	return buffer.AggregateRTPStats(stats)
+	return rtpstats.AggregateRTPStats(stats)
 }
 
 func (w *WebRTCReceiver) GetAudioLevel() (float64, bool) {
@@ -617,7 +631,7 @@ func (w *WebRTCReceiver) GetDeltaStats() map[uint32]*buffer.StreamStatsWithLayer
 		}
 
 		// patch buffer stats with correct layer
-		patched := make(map[int32]*buffer.RTPDeltaInfo, 1)
+		patched := make(map[int32]*rtpstats.RTPDeltaInfo, 1)
 		patched[int32(layer)] = sswl.Layers[0]
 		sswl.Layers = patched
 
@@ -625,6 +639,25 @@ func (w *WebRTCReceiver) GetDeltaStats() map[uint32]*buffer.StreamStatsWithLayer
 	}
 
 	return deltaStats
+}
+
+func (w *WebRTCReceiver) GetLastSenderReportTime() time.Time {
+	w.bufferMu.RLock()
+	defer w.bufferMu.RUnlock()
+
+	latestSRTime := time.Time{}
+	for _, buff := range w.buffers {
+		if buff == nil {
+			continue
+		}
+
+		srAt := buff.GetLastSenderReportTime()
+		if srAt.After(latestSRTime) {
+			latestSRTime = srAt
+		}
+	}
+
+	return latestSRTime
 }
 
 func (w *WebRTCReceiver) forwardRTP(layer int32) {
@@ -670,12 +703,16 @@ func (w *WebRTCReceiver) forwardRTP(layer int32) {
 			}
 		}
 
-		w.downTrackSpreader.Broadcast(func(dt TrackSender) {
+		writeCount := w.downTrackSpreader.Broadcast(func(dt TrackSender) {
 			_ = dt.WriteRTP(pkt, spatialLayer)
 		})
 
 		if redPktWriter != nil {
-			redPktWriter(pkt, spatialLayer)
+			writeCount += redPktWriter(pkt, spatialLayer)
+		}
+
+		if writeCount > 0 && w.forwardStats != nil {
+			w.forwardStats.Update(pkt.Arrival, time.Now().UnixNano())
 		}
 
 		if spatialTracker != nil {
@@ -782,13 +819,12 @@ func (w *WebRTCReceiver) GetTemporalLayerFpsForSpatial(layer int32) []float32 {
 	return b.GetTemporalLayerFpsForSpatial(layer)
 }
 
-func (w *WebRTCReceiver) GetCalculatedClockRate(layer int32) uint32 {
-	return w.streamTrackerManager.GetCalculatedClockRate(layer)
+func (w *WebRTCReceiver) AddOnReady(fn func()) {
+	// webRTCReceiver is always ready after created
+	fn()
 }
 
-func (w *WebRTCReceiver) GetReferenceLayerRTPTimestamp(ts uint32, layer int32, referenceLayer int32) (uint32, error) {
-	return w.streamTrackerManager.GetReferenceLayerRTPTimestamp(ts, layer, referenceLayer)
-}
+// -----------------------------------------------------------
 
 // closes all track senders in parallel, returns when all are closed
 func closeTrackSenders(senders []TrackSender) {

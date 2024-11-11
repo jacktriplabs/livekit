@@ -34,11 +34,11 @@ import (
 
 func TestDeleteRoom(t *testing.T) {
 	t.Run("missing permissions", func(t *testing.T) {
-		svc := newTestRoomService(config.RoomConfig{})
+		svc := newTestRoomService(config.LimitConfig{})
 		grant := &auth.ClaimGrants{
 			Video: &auth.VideoGrant{},
 		}
-		ctx := service.WithGrants(context.Background(), grant)
+		ctx := service.WithGrants(context.Background(), grant, "")
 		_, err := svc.DeleteRoom(ctx, &livekit.DeleteRoomRequest{
 			Room: "testroom",
 		})
@@ -48,11 +48,11 @@ func TestDeleteRoom(t *testing.T) {
 
 func TestMetaDataLimits(t *testing.T) {
 	t.Run("metadata exceed limits", func(t *testing.T) {
-		svc := newTestRoomService(config.RoomConfig{MaxMetadataSize: 5})
+		svc := newTestRoomService(config.LimitConfig{MaxMetadataSize: 5})
 		grant := &auth.ClaimGrants{
 			Video: &auth.VideoGrant{},
 		}
-		ctx := service.WithGrants(context.Background(), grant)
+		ctx := service.WithGrants(context.Background(), grant, "")
 		_, err := svc.UpdateParticipant(ctx, &livekit.UpdateParticipantRequest{
 			Room:     "testroom",
 			Identity: "123",
@@ -72,8 +72,8 @@ func TestMetaDataLimits(t *testing.T) {
 	})
 
 	notExceedsLimitsSvc := map[string]*TestRoomService{
-		"metadata noe exceeds limits": newTestRoomService(config.RoomConfig{MaxMetadataSize: 5}),
-		"metadata no limits":          newTestRoomService(config.RoomConfig{}), // no limits
+		"metadata exceeds limits": newTestRoomService(config.LimitConfig{MaxMetadataSize: 5}),
+		"metadata no limits":      newTestRoomService(config.LimitConfig{}), // no limits
 	}
 
 	for n, s := range notExceedsLimitsSvc {
@@ -82,7 +82,7 @@ func TestMetaDataLimits(t *testing.T) {
 			grant := &auth.ClaimGrants{
 				Video: &auth.VideoGrant{},
 			}
-			ctx := service.WithGrants(context.Background(), grant)
+			ctx := service.WithGrants(context.Background(), grant, "")
 			_, err := svc.UpdateParticipant(ctx, &livekit.UpdateParticipantRequest{
 				Room:     "testroom",
 				Identity: "123",
@@ -104,18 +104,16 @@ func TestMetaDataLimits(t *testing.T) {
 	}
 }
 
-func newTestRoomService(conf config.RoomConfig) *TestRoomService {
+func newTestRoomService(limitConf config.LimitConfig) *TestRoomService {
 	router := &routingfakes.FakeRouter{}
 	allocator := &servicefakes.FakeRoomAllocator{}
 	store := &servicefakes.FakeServiceStore{}
 	svc, err := service.NewRoomService(
-		conf,
+		limitConf,
 		config.APIConfig{ExecutionTimeout: 2},
-		rpc.PSRPCConfig{},
 		router,
 		allocator,
 		store,
-		nil,
 		nil,
 		rpc.NewTopicFormatter(),
 		&rpcfakes.FakeTypedRoomClient{},

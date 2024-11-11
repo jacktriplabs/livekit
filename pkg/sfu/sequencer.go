@@ -42,10 +42,10 @@ func itob(i int) bool {
 }
 
 type packetMeta struct {
-	// Original sequence number from stream.
-	// The original sequence number is used to find the original
+	// Original extended sequence number from stream.
+	// The original extended sequence number is used to find the original
 	// packet from publisher
-	sourceSeqNo uint16
+	sourceSeqNo uint64
 	// Modified sequence number after offset.
 	// This sequence number is used for the associated
 	// down track, is modified according the offsets, and
@@ -67,9 +67,16 @@ type packetMeta struct {
 	// Spatial layer of packet
 	layer int8
 	// Information that differs depending on the codec
-	codecBytes []byte
+	codecBytes       [8]byte
+	numCodecBytesIn  uint8
+	numCodecBytesOut uint8
+	codecBytesSlice  []byte
 	// Dependency Descriptor of packet
-	ddBytes []byte
+	ddBytes      [8]byte
+	ddBytesSize  uint8
+	ddBytesSlice []byte
+	// abs-capture-time of packet
+	actBytes []byte
 }
 
 type extPacketMeta struct {
@@ -97,7 +104,7 @@ type sequencer struct {
 func newSequencer(size int, maybeSparse bool, logger logger.Logger) *sequencer {
 	s := &sequencer{
 		size:      size,
-		startTime: time.Now().UnixMilli(),
+		startTime: time.Now().UnixNano(),
 		meta:      make([]packetMeta, size),
 		rtt:       defaultRtt,
 		logger:    logger,
@@ -121,13 +128,15 @@ func (s *sequencer) setRTT(rtt uint32) {
 }
 
 func (s *sequencer) push(
-	packetTime time.Time,
+	packetTime int64,
 	extIncomingSN, extModifiedSN uint64,
 	extModifiedTS uint64,
 	marker bool,
 	layer int8,
 	codecBytes []byte,
+	numCodecBytesIn int,
 	ddBytes []byte,
+	actBytes []byte,
 ) {
 	s.Lock()
 	defer s.Unlock()
@@ -190,15 +199,31 @@ func (s *sequencer) push(
 
 	slot := extModifiedSNAdjusted % uint64(s.size)
 	s.meta[slot] = packetMeta{
-		sourceSeqNo: uint16(extIncomingSN),
-		targetSeqNo: uint16(extModifiedSN),
-		timestamp:   uint32(extModifiedTS),
-		marker:      marker,
-		layer:       layer,
-		codecBytes:  append([]byte{}, codecBytes...),
-		ddBytes:     append([]byte{}, ddBytes...),
-		lastNack:    s.getRefTime(packetTime), // delay retransmissions after the original transmission
+		sourceSeqNo:     extIncomingSN,
+		targetSeqNo:     uint16(extModifiedSN),
+		timestamp:       uint32(extModifiedTS),
+		marker:          marker,
+		layer:           layer,
+		numCodecBytesIn: uint8(numCodecBytesIn),
+		lastNack:        s.getRefTime(packetTime), // delay retransmissions after the original transmission
 	}
+	pm := &s.meta[slot]
+
+	pm.numCodecBytesOut = uint8(len(codecBytes))
+	if len(codecBytes) > len(pm.codecBytes) {
+		pm.codecBytesSlice = append([]byte{}, codecBytes...)
+	} else {
+		copy(pm.codecBytes[:pm.numCodecBytesOut], codecBytes)
+	}
+
+	pm.ddBytesSize = uint8(len(ddBytes))
+	if len(ddBytes) > len(pm.ddBytes) {
+		pm.ddBytesSlice = append([]byte{}, ddBytes...)
+	} else {
+		copy(pm.ddBytes[:pm.ddBytesSize], ddBytes)
+	}
+
+	pm.actBytes = append([]byte{}, actBytes...)
 
 	if extModifiedSN > s.extHighestSN {
 		s.extHighestSN = extModifiedSN
@@ -212,7 +237,7 @@ func (s *sequencer) pushPadding(extStartSNInclusive uint64, extEndSNInclusive ui
 	s.Lock()
 	defer s.Unlock()
 
-	if s.snRangeMap == nil {
+	if s.snRangeMap == nil || !s.initialized {
 		return
 	}
 
@@ -271,7 +296,7 @@ func (s *sequencer) getExtPacketMetas(seqNo []uint16) []extPacketMeta {
 	snOffset := uint64(0)
 	var err error
 	extPacketMetas := make([]extPacketMeta, 0, len(seqNo))
-	refTime := s.getRefTime(time.Now())
+	refTime := s.getRefTime(time.Now().UnixNano())
 	highestSN := uint16(s.extHighestSN)
 	highestTS := uint32(s.extHighestTS)
 	for _, sn := range seqNo {
@@ -322,8 +347,9 @@ func (s *sequencer) getExtPacketMetas(seqNo []uint16) []extPacketMeta {
 				extSequenceNumber: extSN,
 				extTimestamp:      extTS,
 			}
-			epm.codecBytes = append([]byte{}, meta.codecBytes...)
-			epm.ddBytes = append([]byte{}, meta.ddBytes...)
+			epm.codecBytesSlice = append([]byte{}, meta.codecBytesSlice...)
+			epm.ddBytesSlice = append([]byte{}, meta.ddBytesSlice...)
+			epm.actBytes = append([]byte{}, meta.actBytes...)
 			extPacketMetas = append(extPacketMetas, epm)
 		}
 	}
@@ -331,8 +357,8 @@ func (s *sequencer) getExtPacketMetas(seqNo []uint16) []extPacketMeta {
 	return extPacketMetas
 }
 
-func (s *sequencer) getRefTime(at time.Time) uint32 {
-	return uint32(at.UnixMilli() - s.startTime)
+func (s *sequencer) getRefTime(at int64) uint32 {
+	return uint32((at - s.startTime) / 1e6)
 }
 
 func (s *sequencer) updateSNOffset() {

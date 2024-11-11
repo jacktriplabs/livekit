@@ -15,8 +15,7 @@
 package sfu
 
 import (
-	"fmt"
-
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
@@ -46,26 +45,6 @@ type TranslationParamsRTP struct {
 type SnTs struct {
 	extSequenceNumber uint64
 	extTimestamp      uint64
-}
-
-// ----------------------------------------------------------------------
-
-type RTPMungerState struct {
-	ExtLastSN        uint64
-	ExtSecondLastSN  uint64
-	ExtLastTS        uint64
-	ExtSecondLastTS  uint64
-	LastMarker       bool
-	SecondLastMarker bool
-}
-
-func (r RTPMungerState) String() string {
-	return fmt.Sprintf(
-		"RTPMungerState{extLastSN: %d, extSecondLastSN: %d, extLastTS: %d, extSecondLastTS: %d, lastMarker: %v, secondLastMarker: %v)",
-		r.ExtLastSN, r.ExtSecondLastSN,
-		r.ExtLastTS, r.ExtSecondLastTS,
-		r.LastMarker, r.SecondLastMarker,
-	)
 }
 
 // ----------------------------------------------------------------------
@@ -112,22 +91,26 @@ func (r *RTPMunger) DebugInfo() map[string]interface{} {
 	}
 }
 
-func (r *RTPMunger) GetLast() RTPMungerState {
-	return RTPMungerState{
-		ExtLastSN:        r.extLastSN,
-		ExtSecondLastSN:  r.extSecondLastSN,
-		ExtLastTS:        r.extLastTS,
-		ExtSecondLastTS:  r.extSecondLastTS,
-		LastMarker:       r.lastMarker,
-		SecondLastMarker: r.secondLastMarker,
+func (r *RTPMunger) GetState() *livekit.RTPMungerState {
+	return &livekit.RTPMungerState{
+		ExtLastSequenceNumber:       r.extLastSN,
+		ExtSecondLastSequenceNumber: r.extSecondLastSN,
+		ExtLastTimestamp:            r.extLastTS,
+		ExtSecondLastTimestamp:      r.extSecondLastTS,
+		LastMarker:                  r.lastMarker,
+		SecondLastMarker:            r.secondLastMarker,
 	}
 }
 
-func (r *RTPMunger) SeedLast(state RTPMungerState) {
-	r.extLastSN = state.ExtLastSN
-	r.extSecondLastSN = state.ExtSecondLastSN
-	r.extLastTS = state.ExtLastTS
-	r.extSecondLastTS = state.ExtSecondLastTS
+func (r *RTPMunger) GetTSOffset() uint64 {
+	return r.tsOffset
+}
+
+func (r *RTPMunger) SeedState(state *livekit.RTPMungerState) {
+	r.extLastSN = state.ExtLastSequenceNumber
+	r.extSecondLastSN = state.ExtSecondLastSequenceNumber
+	r.extLastTS = state.ExtLastTimestamp
+	r.extSecondLastTS = state.ExtSecondLastTimestamp
 	r.lastMarker = state.LastMarker
 	r.secondLastMarker = state.SecondLastMarker
 }
@@ -142,6 +125,7 @@ func (r *RTPMunger) SetLastSnTs(extPkt *buffer.ExtPacket) {
 
 	r.extLastTS = extPkt.ExtTimestamp
 	r.extSecondLastTS = extPkt.ExtTimestamp
+	r.tsOffset = 0
 }
 
 func (r *RTPMunger) UpdateSnTsOffsets(extPkt *buffer.ExtPacket, snAdjust uint64, tsAdjust uint64) {
@@ -180,7 +164,7 @@ func (r *RTPMunger) PacketDropped(extPkt *buffer.ExtPacket) {
 	r.lastMarker = r.secondLastMarker
 }
 
-func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (*TranslationParamsRTP, error) {
+func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (TranslationParamsRTP, error) {
 	diff := int64(extPkt.ExtSequenceNumber - r.extHighestIncomingSN)
 	if (diff == 1 && len(extPkt.Packet.Payload) != 0) || diff > 1 {
 		// in-order - either contiguous packet with payload OR packet following a gap, may or may not have payload
@@ -210,7 +194,7 @@ func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (*Tr
 			r.isInRtxGateRegion = false
 		}
 
-		return &TranslationParamsRTP{
+		return TranslationParamsRTP{
 			snOrdering:        ordering,
 			extSequenceNumber: extMungedSN,
 			extTimestamp:      extMungedTS,
@@ -221,7 +205,7 @@ func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (*Tr
 		// out-of-order, look up sequence number offset cache
 		snOffset, err := r.snRangeMap.GetValue(extPkt.ExtSequenceNumber)
 		if err != nil {
-			return &TranslationParamsRTP{
+			return TranslationParamsRTP{
 				snOrdering: SequenceNumberOrderingOutOfOrder,
 			}, ErrOutOfOrderSequenceNumberCacheMiss
 		}
@@ -237,12 +221,12 @@ func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (*Tr
 				"snOffsetIncoming", snOffset,
 				"snOffsetHighest", r.snOffset,
 			)
-			return &TranslationParamsRTP{
+			return TranslationParamsRTP{
 				snOrdering: SequenceNumberOrderingOutOfOrder,
 			}, ErrOutOfOrderSequenceNumberCacheMiss
 		}
 
-		return &TranslationParamsRTP{
+		return TranslationParamsRTP{
 			snOrdering:        SequenceNumberOrderingOutOfOrder,
 			extSequenceNumber: extSequenceNumber,
 			extTimestamp:      extPkt.ExtTimestamp - r.tsOffset,
@@ -259,13 +243,13 @@ func (r *RTPMunger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket, marker bool) (*Tr
 
 		r.updateSnOffset()
 
-		return &TranslationParamsRTP{
+		return TranslationParamsRTP{
 			snOrdering: SequenceNumberOrderingContiguous,
 		}, ErrPaddingOnlyPacket
 	}
 
 	// can get duplicate packet due to FEC
-	return &TranslationParamsRTP{
+	return TranslationParamsRTP{
 		snOrdering: SequenceNumberOrderingDuplicate,
 	}, ErrDuplicatePacket
 }
