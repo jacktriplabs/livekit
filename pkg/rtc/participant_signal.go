@@ -22,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v3"
 
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	"github.com/livekit/psrpc"
 
 	"github.com/livekit/livekit-server/pkg/routing"
@@ -100,7 +101,13 @@ func (p *ParticipantImpl) SendParticipantUpdate(participantsToUpdate []*livekit.
 			// this is a message delivered out of order, a more recent version of the message had already been
 			// sent.
 			if pi.Version < lastVersion.version {
-				p.params.Logger.Debugw("skipping outdated participant update", "otherParticipant", pi.Identity, "otherPID", pi.Sid, "version", pi.Version, "lastVersion", lastVersion)
+				p.params.Logger.Debugw(
+					"skipping outdated participant update",
+					"otherParticipant", pi.Identity,
+					"otherPID", pi.Sid,
+					"version", pi.Version,
+					"lastVersion", lastVersion,
+				)
 				isValid = false
 			}
 		}
@@ -190,6 +197,22 @@ func (p *ParticipantImpl) SendRefreshToken(token string) error {
 	})
 }
 
+func (p *ParticipantImpl) SendRequestResponse(requestResponse *livekit.RequestResponse) error {
+	if requestResponse.RequestId == 0 || !p.params.ClientInfo.SupportErrorResponse() {
+		return nil
+	}
+
+	if requestResponse.Reason == livekit.RequestResponse_OK && !p.ProtocolVersion().SupportsNonErrorSignalResponse() {
+		return nil
+	}
+
+	return p.writeMessage(&livekit.SignalResponse{
+		Message: &livekit.SignalResponse_RequestResponse{
+			RequestResponse: requestResponse,
+		},
+	})
+}
+
 func (p *ParticipantImpl) HandleReconnectAndSendResponse(reconnectReason livekit.ReconnectReason, reconnectResponse *livekit.ReconnectResponse) error {
 	p.TransportManager.HandleClientReconnect(reconnectReason)
 
@@ -245,9 +268,15 @@ func (p *ParticipantImpl) sendDisconnectUpdatesForReconnect() error {
 	})
 }
 
-func (p *ParticipantImpl) sendICECandidate(c *webrtc.ICECandidate, target livekit.SignalTarget) error {
-	trickle := ToProtoTrickle(c.ToJSON())
-	trickle.Target = target
+func (p *ParticipantImpl) sendICECandidate(ic *webrtc.ICECandidate, target livekit.SignalTarget) error {
+	prevIC := p.icQueue[target].Swap(ic)
+	if prevIC == nil {
+		return nil
+	}
+
+	trickle := ToProtoTrickle(prevIC.ToJSON(), target, ic == nil)
+	p.params.Logger.Debugw("sending ICE candidate", "transport", target, "trickle", logger.Proto(trickle))
+
 	return p.writeMessage(&livekit.SignalResponse{
 		Message: &livekit.SignalResponse_Trickle{
 			Trickle: trickle,
@@ -274,6 +303,20 @@ func (p *ParticipantImpl) sendTrackUnpublished(trackID livekit.TrackID) {
 			},
 		},
 	})
+}
+
+func (p *ParticipantImpl) sendTrackHasBeenSubscribed(trackID livekit.TrackID) {
+	if !p.params.ClientInfo.SupportTrackSubscribedEvent() {
+		return
+	}
+	_ = p.writeMessage(&livekit.SignalResponse{
+		Message: &livekit.SignalResponse_TrackSubscribed{
+			TrackSubscribed: &livekit.TrackSubscribed{
+				TrackSid: string(trackID),
+			},
+		},
+	})
+	p.params.Logger.Debugw("track has been subscribed", "trackID", trackID)
 }
 
 func (p *ParticipantImpl) writeMessage(msg *livekit.SignalResponse) error {
@@ -304,9 +347,7 @@ func (p *ParticipantImpl) writeMessage(msg *livekit.SignalResponse) error {
 func (p *ParticipantImpl) CloseSignalConnection(reason types.SignallingCloseReason) {
 	sink := p.getResponseSink()
 	if sink != nil {
-		if reason != types.SignallingCloseReasonParticipantClose {
-			p.params.Logger.Infow("closing signal connection", "reason", reason, "connID", sink.ConnectionID())
-		}
+		p.params.Logger.Debugw("closing signal connection", "reason", reason, "connID", sink.ConnectionID())
 		sink.Close()
 		p.SetResponseSink(nil)
 	}

@@ -23,7 +23,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/protocol/webhook"
 )
 
@@ -33,7 +33,7 @@ func (t *telemetryService) NotifyEvent(ctx context.Context, event *livekit.Webho
 	}
 
 	event.CreatedAt = time.Now().Unix()
-	event.Id = utils.NewGuid("EV_")
+	event.Id = guid.New("EV_")
 
 	if err := t.notifier.QueueNotify(ctx, event); err != nil {
 		logger.Warnw("failed to notify webhook", err, "event", event.Event)
@@ -80,16 +80,18 @@ func (t *telemetryService) ParticipantJoined(
 	shouldSendEvent bool,
 ) {
 	t.enqueue(func() {
-		prometheus.IncrementParticipantRtcConnected(1)
-		prometheus.AddParticipant()
-
-		t.createWorker(
+		_, found := t.getOrCreateWorker(
 			ctx,
 			livekit.RoomID(room.Sid),
 			livekit.RoomName(room.Name),
 			livekit.ParticipantID(participant.Sid),
 			livekit.ParticipantIdentity(participant.Identity),
+			false,
 		)
+		if !found {
+			prometheus.IncrementParticipantRtcConnected(1)
+			prometheus.AddParticipant()
+		}
 
 		if shouldSendEvent {
 			ev := newParticipantEvent(livekit.AnalyticsEventType_PARTICIPANT_JOINED, room, participant)
@@ -117,18 +119,15 @@ func (t *telemetryService) ParticipantActive(
 			})
 		}
 
-		worker, ok := t.getWorker(livekit.ParticipantID(participant.Sid))
-		if !ok {
-			// in case of session migration, we may not have seen a Join event take place.
-			// we'd need to create the worker here before being able to process events
-			worker = t.createWorker(
-				ctx,
-				livekit.RoomID(room.Sid),
-				livekit.RoomName(room.Name),
-				livekit.ParticipantID(participant.Sid),
-				livekit.ParticipantIdentity(participant.Identity),
-			)
-
+		worker, found := t.getOrCreateWorker(
+			ctx,
+			livekit.RoomID(room.Sid),
+			livekit.RoomName(room.Name),
+			livekit.ParticipantID(participant.Sid),
+			livekit.ParticipantIdentity(participant.Identity),
+			false,
+		)
+		if !found {
 			// need to also account for participant count
 			prometheus.AddParticipant()
 		}
@@ -148,6 +147,27 @@ func (t *telemetryService) ParticipantResumed(
 	reason livekit.ReconnectReason,
 ) {
 	t.enqueue(func() {
+		// create a worker if needed.
+		//
+		// Signalling channel stats collector and media channel stats collector could both call
+		// ParticipantJoined and ParticipantLeft.
+		//
+		// On a resume, the signalling channel collector would call `ParticipantLeft` which would close
+		// the corresponding participant's stats worker.
+		//
+		// So, on a successful resume, create the worker if needed.
+		_, found := t.getOrCreateWorker(
+			ctx,
+			livekit.RoomID(room.Sid),
+			livekit.RoomName(room.Name),
+			livekit.ParticipantID(participant.Sid),
+			livekit.ParticipantIdentity(participant.Identity),
+			true,
+		)
+		if !found {
+			prometheus.AddParticipant()
+		}
+
 		ev := newParticipantEvent(livekit.AnalyticsEventType_PARTICIPANT_RESUMED, room, participant)
 		ev.ClientMeta = &livekit.AnalyticsClientMeta{
 			Node:            string(nodeID),
@@ -164,16 +184,11 @@ func (t *telemetryService) ParticipantLeft(ctx context.Context,
 ) {
 	t.enqueue(func() {
 		isConnected := false
-		hasWorker := false
 		if worker, ok := t.getWorker(livekit.ParticipantID(participant.Sid)); ok {
-			hasWorker = true
 			isConnected = worker.IsConnected()
-			worker.Close()
-		}
-
-		if hasWorker {
-			// signifies we had incremented participant count
-			prometheus.SubParticipant()
+			if worker.Close() {
+				prometheus.SubParticipant()
+			}
 		}
 
 		if isConnected && shouldSendEvent {

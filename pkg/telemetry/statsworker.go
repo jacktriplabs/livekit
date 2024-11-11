@@ -19,16 +19,18 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	protoutils "github.com/livekit/protocol/utils"
 )
 
 // StatsWorker handles participant stats
 type StatsWorker struct {
+	next *StatsWorker
+
 	ctx                 context.Context
 	t                   TelemetryService
 	roomID              livekit.RoomID
@@ -91,8 +93,8 @@ func (s *StatsWorker) IsConnected() bool {
 	return s.isConnected
 }
 
-func (s *StatsWorker) Flush() {
-	ts := timestamppb.Now()
+func (s *StatsWorker) Flush(now time.Time) bool {
+	ts := timestamppb.New(now)
 
 	s.lock.Lock()
 	stats := make([]*livekit.AnalyticsStat, 0, len(s.incomingPerTrack)+len(s.outgoingPerTrack))
@@ -102,6 +104,8 @@ func (s *StatsWorker) Flush() {
 
 	outgoingPerTrack := s.outgoingPerTrack
 	s.outgoingPerTrack = make(map[livekit.TrackID][]*livekit.AnalyticsStat)
+
+	closed := !s.closedAt.IsZero() && now.Sub(s.closedAt) > workerCleanupWait
 	s.lock.Unlock()
 
 	stats = s.collectStats(ts, livekit.StreamType_UPSTREAM, incomingPerTrack, stats)
@@ -109,21 +113,25 @@ func (s *StatsWorker) Flush() {
 	if len(stats) > 0 {
 		s.t.SendStats(s.ctx, stats)
 	}
+
+	return closed
 }
 
-func (s *StatsWorker) Close() {
-	s.Flush()
-
+func (s *StatsWorker) Close() bool {
 	s.lock.Lock()
-	s.closedAt = time.Now()
-	s.lock.Unlock()
+	defer s.lock.Unlock()
+
+	ok := s.closedAt.IsZero()
+	if ok {
+		s.closedAt = time.Now()
+	}
+	return ok
 }
 
-func (s *StatsWorker) ClosedAt() time.Time {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-
-	return s.closedAt
+func (s *StatsWorker) Closed() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return !s.closedAt.IsZero()
 }
 
 func (s *StatsWorker) collectStats(
@@ -158,6 +166,8 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 	}
 
 	// find aggregates across streams
+	startTime := time.Time{}
+	endTime := time.Time{}
 	scoreSum := float32(0.0) // used for average
 	minScore := float32(0.0) // min score in batched stats
 	var scores []float32     // used for median
@@ -183,6 +193,16 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 		}
 
 		for _, analyticsStream := range stat.Streams {
+			start := analyticsStream.StartTime.AsTime()
+			if startTime.IsZero() || startTime.After(start) {
+				startTime = start
+			}
+
+			end := analyticsStream.EndTime.AsTime()
+			if endTime.IsZero() || endTime.Before(end) {
+				endTime = end
+			}
+
 			if analyticsStream.Rtt > maxRtt {
 				maxRtt = analyticsStream.Rtt
 			}
@@ -198,6 +218,7 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			coalescedStream.PaddingPackets += analyticsStream.PaddingPackets
 			coalescedStream.PaddingBytes += analyticsStream.PaddingBytes
 			coalescedStream.PacketsLost += analyticsStream.PacketsLost
+			coalescedStream.PacketsOutOfOrder += analyticsStream.PacketsOutOfOrder
 			coalescedStream.Frames += analyticsStream.Frames
 			coalescedStream.Nacks += analyticsStream.Nacks
 			coalescedStream.Plis += analyticsStream.Plis
@@ -206,7 +227,7 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			for _, videoLayer := range analyticsStream.VideoLayers {
 				coalescedVideoLayer := coalescedVideoLayers[videoLayer.Layer]
 				if coalescedVideoLayer == nil {
-					coalescedVideoLayer = proto.Clone(videoLayer).(*livekit.AnalyticsVideoLayer)
+					coalescedVideoLayer = protoutils.CloneProto(videoLayer)
 					coalescedVideoLayers[videoLayer.Layer] = coalescedVideoLayer
 				} else {
 					coalescedVideoLayer.Packets += videoLayer.Packets
@@ -216,6 +237,8 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			}
 		}
 	}
+	coalescedStream.StartTime = timestamppb.New(startTime)
+	coalescedStream.EndTime = timestamppb.New(endTime)
 	coalescedStream.Rtt = maxRtt
 	coalescedStream.Jitter = maxJitter
 
@@ -249,6 +272,7 @@ func isValid(stat *livekit.AnalyticsStat) bool {
 			int32(analyticsStream.PaddingPackets) < 0 ||
 			int64(analyticsStream.PaddingBytes) < 0 ||
 			int32(analyticsStream.PacketsLost) < 0 ||
+			int32(analyticsStream.PacketsOutOfOrder) < 0 ||
 			int32(analyticsStream.Frames) < 0 ||
 			int32(analyticsStream.Nacks) < 0 ||
 			int32(analyticsStream.Plis) < 0 ||

@@ -22,8 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bep/debounce"
 	"github.com/pion/dtls/v2/pkg/crypto/elliptic"
+	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/cc"
 	"github.com/pion/interceptor/pkg/gcc"
@@ -34,28 +34,32 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
+	"go.uber.org/zap/zapcore"
 
-	"github.com/livekit/livekit-server/pkg/config"
-	"github.com/livekit/livekit-server/pkg/rtc/transport"
-	"github.com/livekit/livekit-server/pkg/rtc/types"
-	lkinterceptor "github.com/livekit/livekit-server/pkg/sfu/interceptor"
-	"github.com/livekit/livekit-server/pkg/sfu/pacer"
-	"github.com/livekit/livekit-server/pkg/sfu/rtpextension"
-	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
-	sfuutils "github.com/livekit/livekit-server/pkg/sfu/utils"
-	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
-	sutils "github.com/livekit/livekit-server/pkg/utils"
+	lkinterceptor "github.com/livekit/mediatransportutil/pkg/interceptor"
 	lktwcc "github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/logger/pionlogger"
 	lksdp "github.com/livekit/protocol/sdp"
+
+	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/livekit-server/pkg/rtc/types"
+	sfuinterceptor "github.com/livekit/livekit-server/pkg/sfu/interceptor"
+	"github.com/livekit/livekit-server/pkg/sfu/pacer"
+	pd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/playoutdelay"
+	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
+	sfuutils "github.com/livekit/livekit-server/pkg/sfu/utils"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
+	"github.com/livekit/livekit-server/pkg/utils"
 )
 
 const (
 	LossyDataChannel    = "_lossy"
 	ReliableDataChannel = "_reliable"
 
+	fastNegotiationFrequency   = 10 * time.Millisecond
 	negotiationFrequency       = 150 * time.Millisecond
 	negotiationFailedTimeout   = 15 * time.Second
 	dtlsRetransmissionInterval = 100 * time.Millisecond
@@ -70,8 +74,6 @@ const (
 
 	minConnectTimeoutAfterICE = 10 * time.Second
 	maxConnectTimeoutAfterICE = 20 * time.Second // max duration for waiting pc to connect after ICE is connected
-
-	maxICECandidates = 20
 
 	shortConnectionThreshold = 90 * time.Second
 )
@@ -119,6 +121,7 @@ func (s signal) String() string {
 // -------------------------------------------------------
 
 type event struct {
+	*PCTransport
 	signal signal
 	data   interface{}
 }
@@ -128,6 +131,32 @@ func (e event) String() string {
 }
 
 // -------------------------------------------------------
+
+type wrappedICECandidatePairLogger struct {
+	pair *webrtc.ICECandidatePair
+}
+
+func (w wrappedICECandidatePairLogger) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	if w.pair == nil {
+		return nil
+	}
+
+	if w.pair.Local != nil {
+		e.AddString("localProtocol", w.pair.Local.Protocol.String())
+		e.AddString("localCandidateType", w.pair.Local.Typ.String())
+		e.AddString("localAdddress", w.pair.Local.Address)
+		e.AddUint16("localPort", w.pair.Local.Port)
+	}
+	if w.pair.Remote != nil {
+		e.AddString("remoteProtocol", w.pair.Remote.Protocol.String())
+		e.AddString("remoteCandidateType", w.pair.Remote.Typ.String())
+		e.AddString("remoteAdddress", w.pair.Remote.Address[:len(w.pair.Remote.Address)-3]+"...")
+		e.AddUint16("remotePort", w.pair.Remote.Port)
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------
 
 type SimulcastTrackInfo struct {
 	Mid string
@@ -147,10 +176,12 @@ type PCTransport struct {
 
 	lock sync.RWMutex
 
-	reliableDC       *webrtc.DataChannel
-	reliableDCOpened bool
-	lossyDC          *webrtc.DataChannel
-	lossyDCOpened    bool
+	firstOfferReceived      bool
+	firstOfferNoDataChannel bool
+	reliableDC              *webrtc.DataChannel
+	reliableDCOpened        bool
+	lossyDC                 *webrtc.DataChannel
+	lossyDCOpened           bool
 
 	iceStartedAt               time.Time
 	iceConnectedAt             time.Time
@@ -161,8 +192,9 @@ type PCTransport struct {
 	resetShortConnOnICERestart atomic.Bool
 	signalingRTT               atomic.Uint32 // milliseconds
 
-	debouncedNegotiate func(func())
+	debouncedNegotiate *sfuutils.Debouncer
 	debouncePending    bool
+	lastNegotiate      time.Time
 
 	onNegotiationStateChanged func(state transport.NegotiationState)
 
@@ -180,7 +212,7 @@ type PCTransport struct {
 	preferTCP atomic.Bool
 	isClosed  atomic.Bool
 
-	eventsQueue *sutils.OpsQueue
+	eventsQueue *utils.TypedOpsQueue[event]
 
 	// the following should be accessed only in event processing go routine
 	cacheLocalCandidates      bool
@@ -195,6 +227,7 @@ type PCTransport struct {
 	pendingRestartIceOffer    *webrtc.SessionDescription
 
 	connectionDetails *types.ICEConnectionDetails
+	selectedPair      atomic.Pointer[webrtc.ICECandidatePair]
 }
 
 type TransportParams struct {
@@ -215,13 +248,13 @@ type TransportParams struct {
 	IsSendSide                   bool
 	AllowPlayoutDelay            bool
 	DataChannelMaxBufferedAmount uint64
+	DropRemoteICECandidates      bool
 }
 
 func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimator cc.BandwidthEstimator)) (*webrtc.PeerConnection, *webrtc.MediaEngine, error) {
 	directionConfig := params.DirectionConfig
-
 	if params.AllowPlayoutDelay {
-		directionConfig.RTPHeaderExtension.Video = append(directionConfig.RTPHeaderExtension.Video, rtpextension.PlayoutDelayURI)
+		directionConfig.RTPHeaderExtension.Video = append(directionConfig.RTPHeaderExtension.Video, pd.PlayoutDelayURI)
 	}
 
 	// Some of the browser clients do not handle H.264 High Profile in signalling properly.
@@ -301,6 +334,7 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 
 	ir := &interceptor.Registry{}
 	if params.IsSendSide {
+		se.DetachDataChannels()
 		if params.CongestionControlConfig.UseSendSideBWE {
 			gf, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 				return gcc.NewSendSideBWE(
@@ -322,6 +356,10 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 				}
 			}
 		}
+	} else {
+		// sfu only use interceptor to send XR but don't read response from it (use buffer instead),
+		// so use a empty callback here
+		ir.Add(lkinterceptor.NewRTTFromXRFactory(func(rtt uint32) {}))
 	}
 	if len(params.SimTracks) > 0 {
 		f, err := NewUnhandleSimulcastInterceptorFactory(UnhandleSimulcastTracks(params.SimTracks))
@@ -361,7 +399,7 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 		}
 	}
 	// put rtx interceptor behind unhandle simulcast interceptor so it can get the correct mid & rid
-	ir.Add(lkinterceptor.NewRTXInfoExtractorFactory(setTWCCForVideo, func(repair, base uint32) {
+	ir.Add(sfuinterceptor.NewRTXInfoExtractorFactory(setTWCCForVideo, func(repair, base uint32) {
 		params.Logger.Debugw("rtx pair found from extension", "repair", repair, "base", base)
 		params.Config.BufferFactory.SetRTXPair(repair, base)
 	}, params.Logger))
@@ -379,18 +417,23 @@ func NewPCTransport(params TransportParams) (*PCTransport, error) {
 		params.Logger = logger.GetLogger()
 	}
 	t := &PCTransport{
-		params:                   params,
-		debouncedNegotiate:       debounce.New(negotiationFrequency),
-		negotiationState:         transport.NegotiationStateNone,
-		eventsQueue:              sutils.NewOpsQueue("transport", 64, false),
+		params:             params,
+		debouncedNegotiate: sfuutils.NewDebouncer(negotiationFrequency),
+		negotiationState:   transport.NegotiationStateNone,
+		eventsQueue: utils.NewTypedOpsQueue[event](utils.OpsQueueParams{
+			Name:    "transport",
+			MinSize: 64,
+			Logger:  params.Logger,
+		}),
 		previousTrackDescription: make(map[string]*trackDescription),
 		canReuseTransceiver:      true,
 		connectionDetails:        types.NewICEConnectionDetails(params.Transport, params.Logger),
+		lastNegotiate:            time.Now(),
 	}
 	if params.IsSendSide {
 		t.streamAllocator = streamallocator.NewStreamAllocator(streamallocator.StreamAllocatorParams{
 			Config: params.CongestionControlConfig,
-			Logger: params.Logger.WithComponent(sutils.ComponentCongestionControl),
+			Logger: params.Logger.WithComponent(utils.ComponentCongestionControl),
 		})
 		t.streamAllocator.OnStreamStateChange(params.Handler.OnStreamStateChange)
 		t.streamAllocator.Start()
@@ -424,6 +467,15 @@ func (t *PCTransport) createPeerConnection() error {
 
 	t.pc.OnDataChannel(t.onDataChannel)
 	t.pc.OnTrack(t.params.Handler.OnTrack)
+
+	t.pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
+		t.params.Logger.Debugw("selected ICE candidate pair changed", "pair", wrappedICECandidatePairLogger{pair})
+		t.connectionDetails.SetSelectedPair(pair)
+		if t.selectedPair.Load() != nil {
+			t.params.Logger.Infow("ice reconnected or switched pair", "pair", wrappedICECandidatePairLogger{pair})
+		}
+		t.selectedPair.Store(pair)
+	})
 
 	t.me = me
 
@@ -536,34 +588,6 @@ func (t *PCTransport) IsShortConnection(at time.Time) (bool, time.Duration) {
 	return duration < shortConnectionThreshold, duration
 }
 
-func (t *PCTransport) getSelectedPair() (*webrtc.ICECandidatePair, error) {
-	s := t.pc.SCTP()
-	if s == nil {
-		return nil, errors.New("no SCTP")
-	}
-
-	dtlsTransport := s.Transport()
-	if dtlsTransport == nil {
-		return nil, errors.New("no DTLS transport")
-	}
-
-	iceTransport := dtlsTransport.ICETransport()
-	if iceTransport == nil {
-		return nil, errors.New("no ICE transport")
-	}
-
-	pair, err := iceTransport.GetSelectedCandidatePair()
-	if err != nil {
-		return nil, err
-	}
-
-	if pair == nil {
-		return nil, errors.New("no selected pair")
-	}
-
-	return pair, err
-}
-
 func (t *PCTransport) setConnectedAt(at time.Time) bool {
 	t.lock.Lock()
 	t.connectedAt = at
@@ -602,15 +626,8 @@ func (t *PCTransport) handleConnectionFailed(forceShortConn bool) {
 		var duration time.Duration
 		isShort, duration = t.IsShortConnection(time.Now())
 		if isShort {
-			pair, err := t.getSelectedPair()
-			if err != nil {
-				t.params.Logger.Warnw("short ICE connection", err, "duration", duration)
-			} else {
-				t.params.Logger.Infow("short ICE connection", "pair", pair, "duration", duration)
-			}
+			t.params.Logger.Debugw("short ICE connection", "pair", wrappedICECandidatePairLogger{t.selectedPair.Load()}, "duration", duration)
 		}
-	} else {
-		t.params.Logger.Infow("force short ICE connection")
 	}
 
 	t.params.Handler.OnFailed(isShort)
@@ -621,14 +638,6 @@ func (t *PCTransport) onICEConnectionStateChange(state webrtc.ICEConnectionState
 	switch state {
 	case webrtc.ICEConnectionStateConnected:
 		t.setICEConnectedAt(time.Now())
-		go func() {
-			pair, err := t.getSelectedPair()
-			if err != nil {
-				t.params.Logger.Warnw("failed to get selected candidate pair", err)
-				return
-			}
-			t.connectionDetails.SetSelectedPair(pair)
-		}()
 
 	case webrtc.ICEConnectionStateChecking:
 		t.setICEStartedAt(time.Now())
@@ -690,7 +699,9 @@ func (t *PCTransport) isFullyEstablished() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 
-	return t.reliableDCOpened && t.lossyDCOpened && !t.connectedAt.IsZero()
+	dataChannelReady := t.firstOfferNoDataChannel || (t.reliableDCOpened && t.lossyDCOpened)
+
+	return dataChannelReady && !t.connectedAt.IsZero()
 }
 
 func (t *PCTransport) SetPreferTCP(preferTCP bool) {
@@ -795,16 +806,27 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 	if err != nil {
 		return err
 	}
+	var (
+		dcPtr   **webrtc.DataChannel
+		dcReady *bool
+	)
+	switch dc.Label() {
+	default:
+		// TODO: Appears that it's never called, so not sure what needs to be done here. We just keep the DC open?
+		//       Maybe just add "reliable" parameter instead of checking the label.
+		t.params.Logger.Warnw("unknown data channel label", nil, "label", dc.Label())
+		return nil
+	case ReliableDataChannel:
+		dcPtr = &t.reliableDC
+		dcReady = &t.reliableDCOpened
+	case LossyDataChannel:
+		dcPtr = &t.lossyDC
+		dcReady = &t.lossyDCOpened
+	}
 
 	dcReadyHandler := func() {
 		t.lock.Lock()
-		switch dc.Label() {
-		case ReliableDataChannel:
-			t.reliableDCOpened = true
-
-		case LossyDataChannel:
-			t.lossyDCOpened = true
-		}
+		*dcReady = true
 		t.lock.Unlock()
 		t.params.Logger.Debugw(dc.Label() + " data channel open")
 
@@ -822,30 +844,29 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 	}
 
 	t.lock.Lock()
-	switch dc.Label() {
-	case ReliableDataChannel:
-		t.reliableDC = dc
-		if t.params.DirectionConfig.StrictACKs {
-			t.reliableDC.OnOpen(dcReadyHandler)
-		} else {
-			t.reliableDC.OnDial(dcReadyHandler)
-		}
-		t.reliableDC.OnClose(dcCloseHandler)
-		t.reliableDC.OnError(dcErrorHandler)
-	case LossyDataChannel:
-		t.lossyDC = dc
-		if t.params.DirectionConfig.StrictACKs {
-			t.lossyDC.OnOpen(dcReadyHandler)
-		} else {
-			t.lossyDC.OnDial(dcReadyHandler)
-		}
-		t.lossyDC.OnClose(dcCloseHandler)
-		t.lossyDC.OnError(dcErrorHandler)
-	default:
-		t.params.Logger.Warnw("unknown data channel label", nil, "label", dc.Label())
+	defer t.lock.Unlock()
+	*dcPtr = dc
+	if t.params.DirectionConfig.StrictACKs {
+		dc.OnOpen(func() {
+			if t.params.IsSendSide {
+				if _, err := dc.Detach(); err != nil {
+					t.params.Logger.Warnw("failed to detach data channel", err)
+				}
+			}
+			dcReadyHandler()
+		})
+	} else {
+		dc.OnOpen(func() {
+			if t.params.IsSendSide {
+				if _, err := dc.Detach(); err != nil {
+					t.params.Logger.Warnw("failed to detach data channel", err)
+				}
+			}
+		})
+		dc.OnDial(dcReadyHandler)
 	}
-	t.lock.Unlock()
-
+	dc.OnClose(dcCloseHandler)
+	dc.OnError(dcErrorHandler)
 	return nil
 }
 
@@ -891,18 +912,18 @@ func (t *PCTransport) HasEverConnected() bool {
 	return !t.firstConnectedAt.IsZero()
 }
 
-func (t *PCTransport) GetICEConnectionDetails() *types.ICEConnectionDetails {
-	return t.connectionDetails
+func (t *PCTransport) GetICEConnectionInfo() *types.ICEConnectionInfo {
+	return t.connectionDetails.GetInfo()
 }
 
 func (t *PCTransport) WriteRTCP(pkts []rtcp.Packet) error {
 	return t.pc.WriteRTCP(pkts)
 }
 
-func (t *PCTransport) SendDataPacket(dp *livekit.DataPacket, data []byte) error {
+func (t *PCTransport) SendDataPacket(kind livekit.DataPacket_Kind, encoded []byte) error {
 	var dc *webrtc.DataChannel
 	t.lock.RLock()
-	if dp.Kind == livekit.DataPacket_RELIABLE {
+	if kind == livekit.DataPacket_RELIABLE {
 		dc = t.reliableDC
 	} else {
 		dc = t.lossyDC
@@ -921,7 +942,7 @@ func (t *PCTransport) SendDataPacket(dp *livekit.DataPacket, data []byte) error 
 		return ErrDataChannelBufferFull
 	}
 
-	return dc.Send(data)
+	return dc.Send(encoded)
 }
 
 func (t *PCTransport) Close() {
@@ -982,23 +1003,28 @@ func (t *PCTransport) Negotiate(force bool) {
 		return
 	}
 
+	var postEvent bool
+	t.lock.Lock()
 	if force {
-		t.lock.Lock()
-		t.debouncedNegotiate(func() {
+		t.debouncedNegotiate.Add(func() {
 			// no op to cancel pending negotiation
 		})
 		t.debouncePending = false
-		t.lock.Unlock()
+		t.updateLastNeogitateLocked()
 
-		t.postEvent(event{
-			signal: signalSendOffer,
-		})
+		postEvent = true
 	} else {
-		t.lock.Lock()
 		if !t.debouncePending {
-			t.debouncedNegotiate(func() {
+			if time.Since(t.lastNegotiate) > negotiationFrequency {
+				t.debouncedNegotiate.SetDuration(fastNegotiationFrequency)
+			} else {
+				t.debouncedNegotiate.SetDuration(negotiationFrequency)
+			}
+
+			t.debouncedNegotiate.Add(func() {
 				t.lock.Lock()
 				t.debouncePending = false
+				t.updateLastNeogitateLocked()
 				t.lock.Unlock()
 
 				t.postEvent(event{
@@ -1007,7 +1033,19 @@ func (t *PCTransport) Negotiate(force bool) {
 			})
 			t.debouncePending = true
 		}
-		t.lock.Unlock()
+	}
+	t.lock.Unlock()
+
+	if postEvent {
+		t.postEvent(event{
+			signal: signalSendOffer,
+		})
+	}
+}
+
+func (t *PCTransport) updateLastNeogitateLocked() {
+	if now := time.Now(); now.After(t.lastNegotiate) {
+		t.lastNegotiate = now
 	}
 }
 
@@ -1209,6 +1247,10 @@ func (t *PCTransport) SetPreviousSdp(offer, answer *webrtc.SessionDescription) {
 			}
 		}
 	}
+	// disable fast negotiation temporarily after migration to avoid sending offer
+	// contains part of subscribed tracks before migration, let the subscribed track
+	// resume at the same time.
+	t.lastNegotiate = time.Now().Add(iceFailedTimeoutTotal)
 	t.lock.Unlock()
 }
 
@@ -1240,38 +1282,34 @@ func (t *PCTransport) parseTrackMid(offer webrtc.SessionDescription, senders map
 	return nil
 }
 
-func (t *PCTransport) postEvent(event event) {
-	t.eventsQueue.Enqueue(func() {
-		err := t.handleEvent(&event)
+func (t *PCTransport) postEvent(e event) {
+	e.PCTransport = t
+	t.eventsQueue.Enqueue(func(e event) {
+		var err error
+		switch e.signal {
+		case signalICEGatheringComplete:
+			err = e.handleICEGatheringComplete(e)
+		case signalLocalICECandidate:
+			err = e.handleLocalICECandidate(e)
+		case signalRemoteICECandidate:
+			err = e.handleRemoteICECandidate(e)
+		case signalSendOffer:
+			err = e.handleSendOffer(e)
+		case signalRemoteDescriptionReceived:
+			err = e.handleRemoteDescriptionReceived(e)
+		case signalICERestart:
+			err = e.handleICERestart(e)
+		}
 		if err != nil {
-			if !t.isClosed.Load() {
-				t.params.Logger.Warnw("error handling event", err, "event", event.String())
-				t.params.Handler.OnNegotiationFailed()
+			if !e.isClosed.Load() {
+				e.params.Logger.Warnw("error handling event", err, "event", e.String())
+				e.params.Handler.OnNegotiationFailed()
 			}
 		}
-	})
+	}, e)
 }
 
-func (t *PCTransport) handleEvent(e *event) error {
-	switch e.signal {
-	case signalICEGatheringComplete:
-		return t.handleICEGatheringComplete(e)
-	case signalLocalICECandidate:
-		return t.handleLocalICECandidate(e)
-	case signalRemoteICECandidate:
-		return t.handleRemoteICECandidate(e)
-	case signalSendOffer:
-		return t.handleSendOffer(e)
-	case signalRemoteDescriptionReceived:
-		return t.handleRemoteDescriptionReceived(e)
-	case signalICERestart:
-		return t.handleICERestart(e)
-	}
-
-	return nil
-}
-
-func (t *PCTransport) handleICEGatheringComplete(_ *event) error {
+func (t *PCTransport) handleICEGatheringComplete(_ event) error {
 	if t.params.IsOfferer {
 		return t.handleICEGatheringCompleteOfferer()
 	} else {
@@ -1317,6 +1355,7 @@ func (t *PCTransport) localDescriptionSent() error {
 
 	for _, c := range cachedLocalCandidates {
 		if err := t.params.Handler.OnICECandidate(c, t.params.Transport); err != nil {
+			t.params.Logger.Warnw("failed to send cached ICE candidate", err, "candidate", c)
 			return err
 		}
 	}
@@ -1329,19 +1368,16 @@ func (t *PCTransport) clearLocalDescriptionSent() {
 	t.connectionDetails.Clear()
 }
 
-func (t *PCTransport) handleLocalICECandidate(e *event) error {
+func (t *PCTransport) handleLocalICECandidate(e event) error {
 	c := e.data.(*webrtc.ICECandidate)
 
 	filtered := false
 	if c != nil {
 		if t.preferTCP.Load() && c.Protocol != webrtc.ICEProtocolTCP {
-			t.params.Logger.Debugw("filtering out local candidate",
-				"candidate", func() interface{} {
-					return c.String()
-				})
+			t.params.Logger.Debugw("filtering out local candidate", "candidate", c.String())
 			filtered = true
 		}
-		t.connectionDetails.AddLocalCandidate(c, filtered)
+		t.connectionDetails.AddLocalCandidate(c, filtered, true)
 	}
 
 	if filtered {
@@ -1353,19 +1389,29 @@ func (t *PCTransport) handleLocalICECandidate(e *event) error {
 		return nil
 	}
 
-	return t.params.Handler.OnICECandidate(c, t.params.Transport)
+	if err := t.params.Handler.OnICECandidate(c, t.params.Transport); err != nil {
+		t.params.Logger.Warnw("failed to send ICE candidate", err, "candidate", c)
+		return err
+	}
+
+	return nil
 }
 
-func (t *PCTransport) handleRemoteICECandidate(e *event) error {
+func (t *PCTransport) handleRemoteICECandidate(e event) error {
 	c := e.data.(*webrtc.ICECandidateInit)
 
 	filtered := false
-	if t.preferTCP.Load() && !strings.Contains(c.Candidate, "tcp") {
+	if t.params.DropRemoteICECandidates || (t.preferTCP.Load() && !strings.Contains(c.Candidate, "tcp")) {
 		t.params.Logger.Debugw("filtering out remote candidate", "candidate", c.Candidate)
 		filtered = true
 	}
 
-	t.connectionDetails.AddRemoteCandidate(*c, filtered)
+	if !t.params.Config.UseMDNS && types.IsCandidateMDNS(*c) {
+		t.params.Logger.Debugw("ignoring mDNS candidate", "candidate", c.Candidate)
+		filtered = true
+	}
+
+	t.connectionDetails.AddRemoteCandidate(*c, filtered, true)
 	if filtered {
 		return nil
 	}
@@ -1376,7 +1422,10 @@ func (t *PCTransport) handleRemoteICECandidate(e *event) error {
 	}
 
 	if err := t.pc.AddICECandidate(*c); err != nil {
+		t.params.Logger.Warnw("failed to add cached ICE candidate", err, "candidate", c)
 		return errors.Wrap(err, "add ice candidate failed")
+	} else {
+		t.params.Logger.Debugw("added ICE candidate", "candidate", c)
 	}
 
 	return nil
@@ -1389,7 +1438,7 @@ func (t *PCTransport) setNegotiationState(state transport.NegotiationState) {
 	}
 }
 
-func (t *PCTransport) filterCandidates(sd webrtc.SessionDescription, preferTCP bool) webrtc.SessionDescription {
+func (t *PCTransport) filterCandidates(sd webrtc.SessionDescription, preferTCP, isLocal bool) webrtc.SessionDescription {
 	parsed, err := sd.Unmarshal()
 	if err != nil {
 		t.params.Logger.Warnw("could not unmarshal SDP to filter candidates", err)
@@ -1399,13 +1448,27 @@ func (t *PCTransport) filterCandidates(sd webrtc.SessionDescription, preferTCP b
 	filterAttributes := func(attrs []sdp.Attribute) []sdp.Attribute {
 		filteredAttrs := make([]sdp.Attribute, 0, len(attrs))
 		for _, a := range attrs {
-			if a.Key == sdp.AttrKeyCandidate {
-				if preferTCP {
-					if strings.Contains(a.Value, "tcp") {
-						filteredAttrs = append(filteredAttrs, a)
-					}
-				} else {
+			if a.IsICECandidate() {
+				c, err := ice.UnmarshalCandidate(a.Value)
+				if err != nil {
+					t.params.Logger.Errorw("failed to unmarshal candidate in sdp", err, "isLocal", isLocal, "sdp", sd.SDP)
 					filteredAttrs = append(filteredAttrs, a)
+					continue
+				}
+				excluded := (!isLocal && t.params.DropRemoteICECandidates) || (preferTCP && !c.NetworkType().IsTCP())
+				if !excluded {
+					if !t.params.Config.UseMDNS && types.IsICECandidateMDNS(c) {
+						excluded = true
+					}
+				}
+				if !excluded {
+					filteredAttrs = append(filteredAttrs, a)
+				}
+
+				if isLocal {
+					t.connectionDetails.AddLocalICECandidate(c, excluded, false)
+				} else {
+					t.connectionDetails.AddRemoteICECandidate(c, excluded, false)
 				}
 			} else {
 				filteredAttrs = append(filteredAttrs, a)
@@ -1533,7 +1596,7 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 	// Filtered offer is sent to remote so that remote does not
 	// see filtered candidates.
 	//
-	offer = t.filterCandidates(offer, preferTCP)
+	offer = t.filterCandidates(offer, preferTCP, true)
 	if preferTCP {
 		t.params.Logger.Debugw("local offer (filtered)", "sdp", offer.SDP)
 	}
@@ -1552,11 +1615,11 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 	return t.localDescriptionSent()
 }
 
-func (t *PCTransport) handleSendOffer(_ *event) error {
+func (t *PCTransport) handleSendOffer(_ event) error {
 	return t.createAndSendOffer(nil)
 }
 
-func (t *PCTransport) handleRemoteDescriptionReceived(e *event) error {
+func (t *PCTransport) handleRemoteDescriptionReceived(e event) error {
 	sd := e.data.(*webrtc.SessionDescription)
 	if sd.Type == webrtc.SDPTypeOffer {
 		return t.handleRemoteOfferReceived(sd)
@@ -1583,7 +1646,7 @@ func (t *PCTransport) setRemoteDescription(sd webrtc.SessionDescription) error {
 	if preferTCP {
 		t.params.Logger.Debugw("remote description (unfiltered)", "type", sd.Type, "sdp", sd.SDP)
 	}
-	sd = t.filterCandidates(sd, preferTCP)
+	sd = t.filterCandidates(sd, preferTCP, false)
 	if preferTCP {
 		t.params.Logger.Debugw("remote description (filtered)", "type", sd.Type, "sdp", sd.SDP)
 	}
@@ -1611,7 +1674,10 @@ func (t *PCTransport) setRemoteDescription(sd webrtc.SessionDescription) error {
 
 	for _, c := range t.pendingRemoteCandidates {
 		if err := t.pc.AddICECandidate(*c); err != nil {
+			t.params.Logger.Warnw("failed to add cached ICE candidate", err, "candidate", c)
 			return errors.Wrap(err, "add ice candidate failed")
+		} else {
+			t.params.Logger.Debugw("added cached ICE candidate", "candidate", c)
 		}
 	}
 	t.pendingRemoteCandidates = nil
@@ -1647,7 +1713,7 @@ func (t *PCTransport) createAndSendAnswer() error {
 	// Filtered answer is sent to remote so that remote does not
 	// see filtered candidates.
 	//
-	answer = t.filterCandidates(answer, preferTCP)
+	answer = t.filterCandidates(answer, preferTCP, true)
 	if preferTCP {
 		t.params.Logger.Debugw("local answer (filtered)", "sdp", answer.SDP)
 	}
@@ -1666,6 +1732,21 @@ func (t *PCTransport) handleRemoteOfferReceived(sd *webrtc.SessionDescription) e
 	if err != nil {
 		return nil
 	}
+
+	t.lock.Lock()
+	if !t.firstOfferReceived {
+		t.firstOfferReceived = true
+		var dataChannelFound bool
+		for _, media := range parsed.MediaDescriptions {
+			if strings.EqualFold(media.MediaName.Media, "application") {
+				dataChannelFound = true
+				break
+			}
+		}
+		t.firstOfferNoDataChannel = !dataChannelFound
+	}
+	t.lock.Unlock()
+
 	iceCredential, offerRestartICE, err := t.isRemoteOfferRestartICE(parsed)
 	if err != nil {
 		return errors.Wrap(err, "check remote offer restart ice failed")
@@ -1688,7 +1769,7 @@ func (t *PCTransport) handleRemoteOfferReceived(sd *webrtc.SessionDescription) e
 	if err := t.setRemoteDescription(*sd); err != nil {
 		return err
 	}
-	rtxRepairs := rtxRepairsFromSDP(parsed, t.params.Logger)
+	rtxRepairs := nonSimulcastRTXRepairsFromSDP(parsed, t.params.Logger)
 	if len(rtxRepairs) > 0 {
 		t.params.Logger.Debugw("rtx pairs found from sdp", "ssrcs", rtxRepairs)
 		for repair, base := range rtxRepairs {
@@ -1733,8 +1814,15 @@ func (t *PCTransport) doICERestart() error {
 		return nil
 	}
 
+	// if restart is requested, but negotiation never started
+	iceGatheringState := t.pc.ICEGatheringState()
+	if iceGatheringState == webrtc.ICEGatheringStateNew {
+		t.params.Logger.Debugw("skipping ICE restart on not yet started peer connection")
+		return nil
+	}
+
 	// if restart is requested, and we are not ready, then continue afterwards
-	if t.pc.ICEGatheringState() == webrtc.ICEGatheringStateGathering {
+	if iceGatheringState == webrtc.ICEGatheringStateGathering {
 		t.params.Logger.Debugw("deferring ICE restart to after gathering")
 		t.restartAfterGathering = true
 		return nil
@@ -1781,7 +1869,7 @@ func (t *PCTransport) doICERestart() error {
 	}
 }
 
-func (t *PCTransport) handleICERestart(_ *event) error {
+func (t *PCTransport) handleICERestart(_ event) error {
 	return t.doICERestart()
 }
 
@@ -1819,11 +1907,19 @@ func configureAudioTransceiver(tr *webrtc.RTPTransceiver, stereo bool, nack bool
 	tr.SetCodecPreferences(configCodecs)
 }
 
-func rtxRepairsFromSDP(s *sdp.SessionDescription, logger logger.Logger) map[uint32]uint32 {
+func nonSimulcastRTXRepairsFromSDP(s *sdp.SessionDescription, logger logger.Logger) map[uint32]uint32 {
 	rtxRepairFlows := map[uint32]uint32{}
 	for _, media := range s.MediaDescriptions {
+		// extract rtx repair flows from the media section for non-simulcast stream,
+		// pion will handle simulcast streams by rid probe, don't need handle it here.
+		var ridFound bool
+		rtxPairs := make(map[uint32]uint32)
+	findRTX:
 		for _, attr := range media.Attributes {
 			switch attr.Key {
+			case "rid":
+				ridFound = true
+				break findRTX
 			case sdp.AttrKeySSRCGroup:
 				split := strings.Split(attr.Value, " ")
 				if split[0] == sdp.SemanticTokenFlowIdentification {
@@ -1841,9 +1937,14 @@ func rtxRepairsFromSDP(s *sdp.SessionDescription, logger logger.Logger) map[uint
 							logger.Warnw("Failed to parse SSRC", err, "ssrc", split[2])
 							continue
 						}
-						rtxRepairFlows[uint32(rtxRepairFlow)] = uint32(baseSsrc)
+						rtxPairs[uint32(rtxRepairFlow)] = uint32(baseSsrc)
 					}
 				}
+			}
+		}
+		if !ridFound {
+			for rtx, base := range rtxPairs {
+				rtxRepairFlows[rtx] = base
 			}
 		}
 	}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"golang.org/x/exp/maps"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/protocol/utils"
@@ -46,8 +47,8 @@ type UpTrackManager struct {
 	closed bool
 
 	// publishedTracks that participant is publishing
-	publishedTracks               map[livekit.TrackID]types.MediaTrack
-	subscriptionPermission        *livekit.SubscriptionPermission
+	publishedTracks        map[livekit.TrackID]types.MediaTrack
+	subscriptionPermission *livekit.SubscriptionPermission
 	// subscriber permission for published tracks
 	subscriberPermissions map[livekit.ParticipantIdentity]*livekit.TrackPermission // subscriberIdentity => *livekit.TrackPermission
 
@@ -65,7 +66,7 @@ func NewUpTrackManager(params UpTrackManagerParams) *UpTrackManager {
 	}
 }
 
-func (u *UpTrackManager) Close(willBeResumed bool) {
+func (u *UpTrackManager) Close(isExpectedToResume bool) {
 	u.lock.Lock()
 	if u.closed {
 		u.lock.Unlock()
@@ -79,7 +80,7 @@ func (u *UpTrackManager) Close(willBeResumed bool) {
 	u.lock.Unlock()
 
 	for _, t := range publishedTracks {
-		t.Close(willBeResumed)
+		t.Close(isExpectedToResume)
 	}
 
 	if onClose := u.getOnUpTrackManagerClose(); onClose != nil {
@@ -117,10 +118,7 @@ func (u *UpTrackManager) OnPublishedTrackUpdated(f func(track types.MediaTrack))
 }
 
 func (u *UpTrackManager) SetPublishedTrackMuted(trackID livekit.TrackID, muted bool) types.MediaTrack {
-	u.lock.RLock()
-	track := u.publishedTracks[trackID]
-	u.lock.RUnlock()
-
+	track := u.GetPublishedTrack(trackID)
 	if track != nil {
 		currentMuted := track.IsMuted()
 		track.SetMuted(muted)
@@ -147,17 +145,12 @@ func (u *UpTrackManager) GetPublishedTracks() []types.MediaTrack {
 	u.lock.RLock()
 	defer u.lock.RUnlock()
 
-	tracks := make([]types.MediaTrack, 0, len(u.publishedTracks))
-	for _, t := range u.publishedTracks {
-		tracks = append(tracks, t)
-	}
-	return tracks
+	return maps.Values(u.publishedTracks)
 }
 
 func (u *UpTrackManager) UpdateSubscriptionPermission(
 	subscriptionPermission *livekit.SubscriptionPermission,
 	timedVersion utils.TimedVersion,
-	_ func(participantIdentity livekit.ParticipantIdentity) types.LocalParticipant, // TODO: separate PR to remove this argument
 	resolverBySid func(participantID livekit.ParticipantID) types.LocalParticipant,
 ) error {
 	u.lock.Lock()
@@ -167,25 +160,21 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 		// we do not want to initialize subscriptionPermissionVersion too early since if another machine is the
 		// owner for the data, we'd prefer to use their TimedVersion
 		// ignore older version
-		if !timedVersion.After(&u.subscriptionPermissionVersion) {
-			perms := ""
-			if u.subscriptionPermission != nil {
-				perms = u.subscriptionPermission.String()
-			}
+		if !timedVersion.After(u.subscriptionPermissionVersion) {
 			u.params.Logger.Debugw(
 				"skipping older subscription permission version",
-				"existingValue", perms,
-				"existingVersion", u.subscriptionPermissionVersion.String(),
+				"existingValue", logger.Proto(u.subscriptionPermission),
+				"existingVersion", &u.subscriptionPermissionVersion,
 				"requestingValue", logger.Proto(subscriptionPermission),
-				"requestingVersion", timedVersion.String(),
+				"requestingVersion", &timedVersion,
 			)
 			u.lock.Unlock()
 			return nil
 		}
-		u.subscriptionPermissionVersion.Update(&timedVersion)
+		u.subscriptionPermissionVersion.Update(timedVersion)
 	} else {
 		// for requests coming from the current node, use local versions
-		u.subscriptionPermissionVersion.Update(u.params.VersionGenerator.New())
+		u.subscriptionPermissionVersion.Update(u.params.VersionGenerator.Next())
 	}
 
 	// store as is for use when migrating
@@ -193,7 +182,7 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 	if subscriptionPermission == nil {
 		u.params.Logger.Debugw(
 			"updating subscription permission, setting to nil",
-			"version", u.subscriptionPermissionVersion.String(),
+			"version", u.subscriptionPermissionVersion,
 		)
 		// possible to get a nil when migrating
 		u.lock.Unlock()
@@ -203,11 +192,14 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 	u.params.Logger.Debugw(
 		"updating subscription permission",
 		"permissions", logger.Proto(u.subscriptionPermission),
-		"version", u.subscriptionPermissionVersion.String(),
+		"version", u.subscriptionPermissionVersion,
 	)
 	if err := u.parseSubscriptionPermissionsLocked(subscriptionPermission, func(pID livekit.ParticipantID) types.LocalParticipant {
 		u.lock.Unlock()
-		p := resolverBySid(pID)
+		var p types.LocalParticipant
+		if resolverBySid != nil {
+			p = resolverBySid(pID)
+		}
 		u.lock.Lock()
 		return p
 	}); err != nil {
@@ -241,19 +233,28 @@ func (u *UpTrackManager) HasPermission(trackID livekit.TrackID, subIdentity live
 	return u.hasPermissionLocked(trackID, subIdentity)
 }
 
-func (u *UpTrackManager) UpdateVideoLayers(updateVideoLayers *livekit.UpdateVideoLayers) error {
-	track := u.GetPublishedTrack(livekit.TrackID(updateVideoLayers.TrackSid))
-	if track == nil {
-		u.params.Logger.Warnw("could not find track", nil, "trackID", livekit.TrackID(updateVideoLayers.TrackSid))
-		return errors.New("could not find published track")
+func (u *UpTrackManager) UpdatePublishedAudioTrack(update *livekit.UpdateLocalAudioTrack) types.MediaTrack {
+	track := u.GetPublishedTrack(livekit.TrackID(update.TrackSid))
+	if track != nil {
+		track.UpdateAudioTrack(update)
+		if u.onTrackUpdated != nil {
+			u.onTrackUpdated(track)
+		}
 	}
 
-	track.UpdateVideoLayers(updateVideoLayers.Layers)
-	if u.onTrackUpdated != nil {
-		u.onTrackUpdated(track)
+	return track
+}
+
+func (u *UpTrackManager) UpdatePublishedVideoTrack(update *livekit.UpdateLocalVideoTrack) types.MediaTrack {
+	track := u.GetPublishedTrack(livekit.TrackID(update.TrackSid))
+	if track != nil {
+		track.UpdateVideoTrack(update)
+		if u.onTrackUpdated != nil {
+			u.onTrackUpdated(track)
+		}
 	}
 
-	return nil
+	return track
 }
 
 func (u *UpTrackManager) AddPublishedTrack(track types.MediaTrack) {
@@ -264,7 +265,7 @@ func (u *UpTrackManager) AddPublishedTrack(track types.MediaTrack) {
 	u.lock.Unlock()
 	u.params.Logger.Debugw("added published track", "trackID", track.ID(), "trackInfo", logger.Proto(track.ToProto()))
 
-	track.AddOnClose(func() {
+	track.AddOnClose(func(_isExpectedToResume bool) {
 		u.lock.Lock()
 		delete(u.publishedTracks, track.ID())
 		// not modifying subscription permissions, will get reset on next update from participant
@@ -272,11 +273,11 @@ func (u *UpTrackManager) AddPublishedTrack(track types.MediaTrack) {
 	})
 }
 
-func (u *UpTrackManager) RemovePublishedTrack(track types.MediaTrack, willBeResumed bool, shouldClose bool) {
+func (u *UpTrackManager) RemovePublishedTrack(track types.MediaTrack, isExpectedToResume bool, shouldClose bool) {
 	if shouldClose {
-		track.Close(willBeResumed)
+		track.Close(isExpectedToResume)
 	} else {
-		track.ClearAllReceivers(willBeResumed)
+		track.ClearAllReceivers(isExpectedToResume)
 	}
 	u.lock.Lock()
 	delete(u.publishedTracks, track.ID())

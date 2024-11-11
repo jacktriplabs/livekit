@@ -15,27 +15,30 @@
 package rtc
 
 import (
+	"io"
 	"math/bits"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/pion/ice/v2"
 	"github.com/pion/rtcp"
+	"github.com/pion/sctp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/mediatransportutil/pkg/twcc"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
+
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
-	"github.com/livekit/mediatransportutil/pkg/twcc"
-	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
+	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
 const (
@@ -89,6 +92,8 @@ type TransportManagerParams struct {
 	Logger                       logger.Logger
 	PublisherHandler             transport.Handler
 	SubscriberHandler            transport.Handler
+	DataChannelStats             *telemetry.BytesTrackStats
+	DropRemoteICECandidates      bool
 }
 
 type TransportManager struct {
@@ -142,6 +147,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		ClientInfo:              params.ClientInfo,
 		Transport:               livekit.SignalTarget_PUBLISHER,
 		Handler:                 TransportManagerPublisherTransportHandler{TransportManagerTransportHandler{params.PublisherHandler, t}},
+		DropRemoteICECandidates: params.DropRemoteICECandidates,
 	})
 	if err != nil {
 		return nil, err
@@ -164,6 +170,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		DataChannelMaxBufferedAmount: params.DataChannelMaxBufferedAmount,
 		Transport:                    livekit.SignalTarget_SUBSCRIBER,
 		Handler:                      TransportManagerTransportHandler{params.SubscriberHandler, t},
+		DropRemoteICECandidates:      params.DropRemoteICECandidates,
 	})
 	if err != nil {
 		return nil, err
@@ -240,9 +247,21 @@ func (t *TransportManager) RemoveSubscribedTrack(subTrack types.SubscribedTrack)
 	t.subscriber.RemoveTrackFromStreamAllocator(subTrack)
 }
 
-func (t *TransportManager) SendDataPacket(dp *livekit.DataPacket, data []byte) error {
+func (t *TransportManager) SendDataPacket(kind livekit.DataPacket_Kind, encoded []byte) error {
 	// downstream data is sent via primary peer connection
-	return t.getTransport(true).SendDataPacket(dp, data)
+	err := t.getTransport(true).SendDataPacket(kind, encoded)
+	if err != nil {
+		if !utils.ErrorIsOneOf(err, io.ErrClosedPipe, sctp.ErrStreamClosed, ErrTransportFailure, ErrDataChannelBufferFull) {
+			t.params.Logger.Warnw("send data packet error", err)
+		}
+		if utils.ErrorIsOneOf(err, sctp.ErrStreamClosed, io.ErrClosedPipe) {
+			t.params.SubscriberHandler.OnDataSendError(err)
+		}
+	} else {
+		t.params.DataChannelStats.AddBytes(uint64(len(encoded)), true)
+	}
+
+	return err
 }
 
 func (t *TransportManager) createDataChannelsForSubscriber(pendingDataChannels []*livekit.DataChannelInfo) error {
@@ -371,19 +390,6 @@ func (t *TransportManager) HandleAnswer(answer webrtc.SessionDescription) {
 
 // AddICECandidate adds candidates for remote peer
 func (t *TransportManager) AddICECandidate(candidate webrtc.ICECandidateInit, target livekit.SignalTarget) {
-	if !t.params.Config.UseMDNS {
-		candidateValue := strings.TrimPrefix(candidate.Candidate, "candidate:")
-		if candidateValue != "" {
-			candidate, err := ice.UnmarshalCandidate(candidateValue)
-			if err != nil {
-				t.params.Logger.Errorw("failed to parse ice candidate", err)
-			} else if strings.HasSuffix(candidate.Address(), ".local") {
-				t.params.Logger.Debugw("ignoring mDNS candidate", "candidate", candidateValue, "target", target)
-				return
-			}
-		}
-	}
-
 	switch target {
 	case livekit.SignalTarget_PUBLISHER:
 		t.publisher.AddICECandidate(candidate)
@@ -430,9 +436,7 @@ func (t *TransportManager) HandleClientReconnect(reason livekit.ReconnectReason)
 }
 
 func (t *TransportManager) ICERestart(iceConfig *livekit.ICEConfig) error {
-	if iceConfig != nil {
-		t.SetICEConfig(iceConfig)
-	}
+	t.SetICEConfig(iceConfig)
 
 	return t.subscriber.ICERestart()
 }
@@ -444,7 +448,18 @@ func (t *TransportManager) OnICEConfigChanged(f func(iceConfig *livekit.ICEConfi
 }
 
 func (t *TransportManager) SetICEConfig(iceConfig *livekit.ICEConfig) {
-	t.configureICE(iceConfig, true)
+	if iceConfig != nil {
+		t.configureICE(iceConfig, true)
+	}
+}
+
+func (t *TransportManager) GetICEConfig() *livekit.ICEConfig {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	if t.iceConfig == nil {
+		return nil
+	}
+	return utils.CloneProto(t.iceConfig)
 }
 
 func (t *TransportManager) resetTransportConfigureLocked(reconfigured bool) {
@@ -466,7 +481,7 @@ func (t *TransportManager) configureICE(iceConfig *livekit.ICEConfig, reset bool
 		return
 	}
 
-	t.params.Logger.Infow("setting ICE config", "iceConfig", iceConfig)
+	t.params.Logger.Infow("setting ICE config", "iceConfig", logger.Proto(iceConfig))
 	onICEConfigChanged := t.onICEConfigChanged
 	t.iceConfig = iceConfig
 	t.lock.Unlock()
@@ -487,15 +502,15 @@ func (t *TransportManager) SubscriberAsPrimary() bool {
 	return t.params.SubscriberAsPrimary
 }
 
-func (t *TransportManager) GetICEConnectionDetails() []*types.ICEConnectionDetails {
-	details := make([]*types.ICEConnectionDetails, 0, 2)
+func (t *TransportManager) GetICEConnectionInfo() []*types.ICEConnectionInfo {
+	infos := make([]*types.ICEConnectionInfo, 0, 2)
 	for _, pc := range []*PCTransport{t.publisher, t.subscriber} {
-		cd := pc.GetICEConnectionDetails()
-		if cd.HasCandidates() {
-			details = append(details, cd.Clone())
+		info := pc.GetICEConnectionInfo()
+		if info.HasCandidates() {
+			infos = append(infos, info)
 		}
 	}
-	return details
+	return infos
 }
 
 func (t *TransportManager) getTransport(isPrimary bool) *PCTransport {
@@ -523,8 +538,11 @@ func (t *TransportManager) handleConnectionFailed(isShortLived bool) {
 	if !t.hasRecentSignalLocked() || !signalValid {
 		// the failed might cause by network interrupt because signal closed or we have not seen any signal in the time window,
 		// so don't switch to next candidate type
-		t.params.Logger.Infow("ignoring prefer candidate check by ICE failure because signal connection interrupted",
-			"lastSignalSince", lastSignalSince, "signalValid", signalValid)
+		t.params.Logger.Debugw(
+			"ignoring prefer candidate check by ICE failure because signal connection interrupted",
+			"lastSignalSince", lastSignalSince,
+			"signalValid", signalValid,
+		)
 		t.failureCount = 0
 		t.lastFailure = time.Time{}
 		t.lock.Unlock()
@@ -572,13 +590,13 @@ func (t *TransportManager) handleConnectionFailed(isShortLived bool) {
 
 	switch preferNext {
 	case livekit.ICECandidateType_ICT_TCP:
-		t.params.Logger.Infow("prefer TCP transport on both peer connections")
+		t.params.Logger.Debugw("prefer TCP transport on both peer connections")
 
 	case livekit.ICECandidateType_ICT_TLS:
-		t.params.Logger.Infow("prefer TLS transport both peer connections")
+		t.params.Logger.Debugw("prefer TLS transport both peer connections")
 
 	case livekit.ICECandidateType_ICT_NONE:
-		t.params.Logger.Infow("allowing all transports on both peer connections")
+		t.params.Logger.Debugw("allowing all transports on both peer connections")
 	}
 
 	// irrespective of which one fails, force prefer candidate on both as the other one might

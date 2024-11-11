@@ -24,15 +24,19 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/exp/maps"
 
-	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
-	"github.com/livekit/livekit-server/version"
+	"github.com/livekit/livekit-server/pkg/agent"
+	"github.com/livekit/livekit-server/pkg/sfu"
+	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
+	"github.com/livekit/protocol/utils/must"
 	"github.com/livekit/psrpc"
+	"github.com/livekit/psrpc/pkg/middleware"
 
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
@@ -40,20 +44,21 @@ import (
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
+	"github.com/livekit/livekit-server/version"
 )
 
 const (
 	roomPurgeSeconds     = 24 * 60 * 60
 	tokenRefreshInterval = 5 * time.Minute
 	tokenDefaultTTL      = 10 * time.Minute
-	iceConfigTTL         = 5 * time.Minute
 )
 
 var affinityEpoch = time.Date(2000, 0, 0, 0, 0, 0, 0, time.UTC)
 
-type iceConfigCacheEntry struct {
-	iceConfig  *livekit.ICEConfig
-	modifiedAt time.Time
+type iceConfigCacheKey struct {
+	roomName            livekit.RoomName
+	participantIdentity livekit.ParticipantIdentity
 }
 
 // RoomManager manages rooms and its interaction with participants.
@@ -66,10 +71,13 @@ type RoomManager struct {
 	serverInfo        *livekit.ServerInfo
 	currentNode       routing.LocalNode
 	router            routing.Router
+	roomAllocator     RoomAllocator
+	roomManagerServer rpc.TypedRoomManagerServer
 	roomStore         ObjectStore
 	telemetry         telemetry.TelemetryService
 	clientConfManager clientconfiguration.ClientConfigurationManager
-	agentClient       rtc.AgentClient
+	agentClient       agent.Client
+	agentStore        AgentStore
 	egressLauncher    rtc.EgressLauncher
 	versionGenerator  utils.TimedVersionGenerator
 	turnAuthHandler   *TURNAuthHandler
@@ -77,10 +85,13 @@ type RoomManager struct {
 
 	rooms map[livekit.RoomName]*rtc.Room
 
-	roomServers        utils.MultitonService[rpc.RoomTopic]
-	participantServers utils.MultitonService[rpc.ParticipantTopic]
+	roomServers          utils.MultitonService[rpc.RoomTopic]
+	agentDispatchServers utils.MultitonService[rpc.RoomTopic]
+	participantServers   utils.MultitonService[rpc.ParticipantTopic]
 
-	iceConfigCache map[livekit.ParticipantIdentity]*iceConfigCacheEntry
+	iceConfigCache *sutils.IceConfigCache[iceConfigCacheKey]
+
+	forwardStats *sfu.ForwardStats
 }
 
 func NewLocalRoomManager(
@@ -88,45 +99,62 @@ func NewLocalRoomManager(
 	roomStore ObjectStore,
 	currentNode routing.LocalNode,
 	router routing.Router,
+	roomAllocator RoomAllocator,
 	telemetry telemetry.TelemetryService,
 	clientConfManager clientconfiguration.ClientConfigurationManager,
-	agentClient rtc.AgentClient,
+	agentClient agent.Client,
+	agentStore AgentStore,
 	egressLauncher rtc.EgressLauncher,
 	versionGenerator utils.TimedVersionGenerator,
 	turnAuthHandler *TURNAuthHandler,
 	bus psrpc.MessageBus,
+	forwardStats *sfu.ForwardStats,
 ) (*RoomManager, error) {
 	rtcConf, err := rtc.NewWebRTCConfig(conf)
 	if err != nil {
 		return nil, err
 	}
 
-	return &RoomManager{
+	r := &RoomManager{
 		config:            conf,
 		rtcConfig:         rtcConf,
 		currentNode:       currentNode,
 		router:            router,
+		roomAllocator:     roomAllocator,
 		roomStore:         roomStore,
 		telemetry:         telemetry,
 		clientConfManager: clientConfManager,
 		egressLauncher:    egressLauncher,
 		agentClient:       agentClient,
+		agentStore:        agentStore,
 		versionGenerator:  versionGenerator,
 		turnAuthHandler:   turnAuthHandler,
 		bus:               bus,
+		forwardStats:      forwardStats,
 
 		rooms: make(map[livekit.RoomName]*rtc.Room),
 
-		iceConfigCache: make(map[livekit.ParticipantIdentity]*iceConfigCacheEntry),
+		iceConfigCache: sutils.NewIceConfigCache[iceConfigCacheKey](0),
 
 		serverInfo: &livekit.ServerInfo{
-			Edition:  livekit.ServerInfo_Standard,
-			Version:  version.Version,
-			Protocol: types.CurrentProtocol,
-			Region:   conf.Region,
-			NodeId:   currentNode.Id,
+			Edition:       livekit.ServerInfo_Standard,
+			Version:       version.Version,
+			Protocol:      types.CurrentProtocol,
+			AgentProtocol: agent.CurrentProtocol,
+			Region:        conf.Region,
+			NodeId:        currentNode.Id,
 		},
-	}, nil
+	}
+
+	r.roomManagerServer, err = rpc.NewTypedRoomManagerServer(r, bus, rpc.WithServerLogger(logger.GetLogger()), middleware.WithServerMetrics(rpc.PSRPCMetricsObserver{}), psrpc.WithServerChannelSize(conf.PSRPC.BufferSize))
+	if err != nil {
+		return nil, err
+	}
+	if err := r.roomManagerServer.RegisterAllNodeTopics(livekit.NodeID(currentNode.Id)); err != nil {
+		return nil, err
+	}
+
+	return r, nil
 }
 
 func (r *RoomManager) GetRoom(_ context.Context, roomName livekit.RoomName) *rtc.Room {
@@ -216,7 +244,9 @@ func (r *RoomManager) Stop() {
 		room.Close(types.ParticipantCloseReasonRoomManagerStop)
 	}
 
+	r.roomManagerServer.Kill()
 	r.roomServers.Kill()
+	r.agentDispatchServers.Kill()
 	r.participantServers.Kill()
 
 	if r.rtcConfig != nil {
@@ -227,19 +257,35 @@ func (r *RoomManager) Stop() {
 			_ = r.rtcConfig.TCPMuxListener.Close()
 		}
 	}
+
+	r.iceConfigCache.Stop()
+
+	if r.forwardStats != nil {
+		r.forwardStats.Stop()
+	}
+}
+
+func (r *RoomManager) CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest) (*livekit.Room, error) {
+	room, err := r.getOrCreateRoom(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer room.Release()
+
+	return room.ToProto(), nil
 }
 
 // StartSession starts WebRTC session when a new participant is connected, takes place on RTC node
 func (r *RoomManager) StartSession(
 	ctx context.Context,
-	roomName livekit.RoomName,
+	createRoom *livekit.CreateRoomRequest,
 	pi routing.ParticipantInit,
 	requestSource routing.MessageSource,
 	responseSink routing.MessageSink,
 ) error {
 	sessionStartTime := time.Now()
 
-	room, err := r.getOrCreateRoom(ctx, roomName)
+	room, err := r.getOrCreateRoom(ctx, createRoom)
 	if err != nil {
 		return err
 	}
@@ -268,7 +314,7 @@ func (r *RoomManager) StartSession(
 				//
 				// It is possible that the client did not get that send request. So, send it again.
 				logger.Infow("cannot restart a closed participant",
-					"room", roomName,
+					"room", room.Name(),
 					"nodeID", r.currentNode.Id,
 					"participant", pi.Identity,
 					"reason", pi.ReconnectReason,
@@ -300,14 +346,12 @@ func (r *RoomManager) StartSession(
 				"reason", pi.ReconnectReason,
 				"numParticipants", room.GetParticipantCount(),
 			)
-			iceConfig := r.getIceConfig(participant)
-			if iceConfig == nil {
-				iceConfig = &livekit.ICEConfig{}
-			}
+			iceConfig := r.getIceConfig(room.Name(), participant)
 			if err = room.ResumeParticipant(
 				participant,
 				requestSource,
 				responseSink,
+				iceConfig,
 				r.iceServersForParticipant(
 					apiKey,
 					participant,
@@ -315,7 +359,7 @@ func (r *RoomManager) StartSession(
 				),
 				pi.ReconnectReason,
 			); err != nil {
-				logger.Warnw("could not resume participant", err, "participant", pi.Identity)
+				participant.GetLogger().Warnw("could not resume participant", err)
 				return err
 			}
 			r.telemetry.ParticipantResumed(ctx, room.ToProto(), participant.ToProto(), livekit.NodeID(r.currentNode.Id), pi.ReconnectReason)
@@ -350,15 +394,22 @@ func (r *RoomManager) StartSession(
 		return errors.New("could not restart participant")
 	}
 
-	logger.Debugw("starting RTC session",
-		"room", roomName,
+	sid := livekit.ParticipantID(guid.New(utils.ParticipantPrefix))
+	pLogger := rtc.LoggerWithParticipant(
+		rtc.LoggerWithRoom(logger.GetLogger(), room.Name(), room.ID()),
+		pi.Identity,
+		sid,
+		false,
+	)
+	pLogger.Infow("starting RTC session",
+		"room", room.Name(),
 		"nodeID", r.currentNode.Id,
-		"participant", pi.Identity,
 		"clientInfo", logger.Proto(pi.Client),
 		"reconnect", pi.Reconnect,
 		"reconnectReason", pi.ReconnectReason,
 		"adaptiveStream", pi.AdaptiveStream,
 		"numParticipants", room.GetParticipantCount(),
+		"kind", pi.Grants.GetParticipantKind(),
 	)
 
 	clientConf := r.clientConfManager.GetConfiguration(pi.Client)
@@ -366,12 +417,9 @@ func (r *RoomManager) StartSession(
 	pv := types.ProtocolVersion(pi.Client.Protocol)
 	rtcConf := *r.rtcConfig
 	rtcConf.SetBufferFactory(room.GetBufferFactory())
-	sid := livekit.ParticipantID(utils.NewGuid(utils.ParticipantPrefix))
-	pLogger := rtc.LoggerWithParticipant(
-		rtc.LoggerWithRoom(logger.GetLogger(), room.Name(), room.ID()),
-		pi.Identity,
-		sid,
-		false)
+	if pi.DisableICELite {
+		rtcConf.SettingEngine.SetLite(false)
+	}
 	// default allow forceTCP
 	allowFallback := true
 	if r.config.RTC.AllowTCPFallback != nil {
@@ -404,6 +452,7 @@ func (r *RoomManager) StartSession(
 		Sink:                    responseSink,
 		AudioConfig:             r.config.Audio,
 		VideoConfig:             r.config.Video,
+		LimitConfig:             r.config.Limit,
 		ProtocolVersion:         pv,
 		SessionStartTime:        sessionStartTime,
 		Telemetry:               r.telemetry,
@@ -413,6 +462,7 @@ func (r *RoomManager) StartSession(
 		PublishEnabledCodecs:    protoRoom.EnabledCodecs,
 		SubscribeEnabledCodecs:  protoRoom.EnabledCodecs,
 		Grants:                  pi.Grants,
+		Reconnect:               pi.Reconnect,
 		Logger:                  pLogger,
 		ClientConf:              clientConf,
 		ClientInfo:              rtc.ClientInfo{ClientInfo: pi.Client},
@@ -437,11 +487,13 @@ func (r *RoomManager) StartSession(
 		SubscriptionLimitVideo:       r.config.Limit.SubscriptionLimitVideo,
 		PlayoutDelay:                 roomInternal.GetPlayoutDelay(),
 		SyncStreams:                  roomInternal.GetSyncStreams(),
+		ForwardStats:                 r.forwardStats,
+		MetricConfig:                 r.config.Metric,
 	})
 	if err != nil {
 		return err
 	}
-	iceConfig := r.setIceConfig(participant)
+	iceConfig := r.setIceConfig(room.Name(), participant)
 
 	// join room
 	opts := rtc.ParticipantOptions{
@@ -454,8 +506,8 @@ func (r *RoomManager) StartSession(
 		return err
 	}
 
-	participantTopic := rpc.FormatParticipantTopic(roomName, participant.Identity())
-	participantServer := utils.Must(rpc.NewTypedParticipantServer(r, r.bus))
+	participantTopic := rpc.FormatParticipantTopic(room.Name(), participant.Identity())
+	participantServer := must.Get(rpc.NewTypedParticipantServer(r, r.bus))
 	killParticipantServer := r.participantServers.Replace(participantTopic, participantServer)
 	if err := participantServer.RegisterAllParticipantTopics(participantTopic); err != nil {
 		killParticipantServer()
@@ -464,7 +516,7 @@ func (r *RoomManager) StartSession(
 		return err
 	}
 
-	if err = r.roomStore.StoreParticipant(ctx, roomName, participant.ToProto()); err != nil {
+	if err = r.roomStore.StoreParticipant(ctx, room.Name(), participant.ToProto()); err != nil {
 		pLogger.Errorw("could not store participant", err)
 	}
 
@@ -485,7 +537,7 @@ func (r *RoomManager) StartSession(
 	participant.OnClose(func(p types.LocalParticipant) {
 		killParticipantServer()
 
-		if err := r.roomStore.DeleteParticipant(ctx, roomName, p.Identity()); err != nil {
+		if err := r.roomStore.DeleteParticipant(ctx, room.Name(), p.Identity()); err != nil {
 			pLogger.Errorw("could not delete participant", err)
 		}
 
@@ -497,16 +549,11 @@ func (r *RoomManager) StartSession(
 	participant.OnClaimsChanged(func(participant types.LocalParticipant) {
 		pLogger.Debugw("refreshing client token after claims change")
 		if err := r.refreshToken(participant); err != nil {
-			logger.Errorw("could not refresh token", err)
+			pLogger.Errorw("could not refresh token", err)
 		}
 	})
 	participant.OnICEConfigChanged(func(participant types.LocalParticipant, iceConfig *livekit.ICEConfig) {
-		r.lock.Lock()
-		r.iceConfigCache[participant.Identity()] = &iceConfigCacheEntry{
-			iceConfig:  iceConfig,
-			modifiedAt: time.Now(),
-		}
-		r.lock.Unlock()
+		r.iceConfigCache.Put(iceConfigCacheKey{room.Name(), participant.Identity()}, iceConfig)
 	})
 
 	go r.rtcSessionWorker(room, participant, requestSource)
@@ -514,7 +561,9 @@ func (r *RoomManager) StartSession(
 }
 
 // create the actual room object, to be used on RTC node
-func (r *RoomManager) getOrCreateRoom(ctx context.Context, roomName livekit.RoomName) (*rtc.Room, error) {
+func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.CreateRoomRequest) (*rtc.Room, error) {
+	roomName := livekit.RoomName(createRoom.Name)
+
 	r.lock.RLock()
 	lastSeenRoom := r.rooms[roomName]
 	r.lock.RUnlock()
@@ -524,7 +573,7 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, roomName livekit.Room
 	}
 
 	// create new room, get details first
-	ri, internal, err := r.roomStore.LoadRoom(ctx, roomName, true)
+	ri, internal, created, err := r.roomAllocator.CreateRoom(ctx, createRoom, true)
 	if err != nil {
 		return nil, err
 	}
@@ -544,19 +593,28 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, roomName livekit.Room
 	}
 
 	// construct ice servers
-	newRoom := rtc.NewRoom(ri, internal, *r.rtcConfig, &r.config.Audio, r.serverInfo, r.telemetry, r.agentClient, r.egressLauncher)
+	newRoom := rtc.NewRoom(ri, internal, *r.rtcConfig, r.config.Room, &r.config.Audio, r.serverInfo, r.telemetry, r.agentClient, r.agentStore, r.egressLauncher)
 
 	roomTopic := rpc.FormatRoomTopic(roomName)
-	roomServer := utils.Must(rpc.NewTypedRoomServer(r, r.bus))
+	roomServer := must.Get(rpc.NewTypedRoomServer(r, r.bus))
 	killRoomServer := r.roomServers.Replace(roomTopic, roomServer)
 	if err := roomServer.RegisterAllRoomTopics(roomTopic); err != nil {
 		killRoomServer()
 		r.lock.Unlock()
 		return nil, err
 	}
+	agentDispatchServer := must.Get(rpc.NewTypedAgentDispatchInternalServer(r, r.bus))
+	killDispServer := r.agentDispatchServers.Replace(roomTopic, agentDispatchServer)
+	if err := agentDispatchServer.RegisterAllRoomTopics(roomTopic); err != nil {
+		killRoomServer()
+		killDispServer()
+		r.lock.Unlock()
+		return nil, err
+	}
 
 	newRoom.OnClose(func() {
 		killRoomServer()
+		killDispServer()
 
 		roomInfo := newRoom.ToProto()
 		r.telemetry.RoomEnded(ctx, roomInfo)
@@ -591,6 +649,21 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, roomName livekit.Room
 	r.telemetry.RoomStarted(ctx, newRoom.ToProto())
 	prometheus.RoomStarted()
 
+	if created && createRoom.GetEgress().GetRoom() != nil {
+		// ensure room name matches
+		createRoom.Egress.Room.RoomName = createRoom.Name
+		_, err = r.egressLauncher.StartEgress(ctx, &rpc.StartEgressRequest{
+			Request: &rpc.StartEgressRequest_RoomComposite{
+				RoomComposite: createRoom.Egress.Room,
+			},
+			RoomId: ri.Sid,
+		})
+		if err != nil {
+			newRoom.Release()
+			return nil, err
+		}
+	}
+
 	return newRoom, nil
 }
 
@@ -617,23 +690,16 @@ func (r *RoomManager) rtcSessionWorker(room *rtc.Room, participant types.LocalPa
 	_ = r.refreshToken(participant)
 	tokenTicker := time.NewTicker(tokenRefreshInterval)
 	defer tokenTicker.Stop()
-	stateCheckTicker := time.NewTicker(time.Millisecond * 500)
-	defer stateCheckTicker.Stop()
 	for {
 		select {
-		case <-stateCheckTicker.C:
-			// periodic check to ensure participant didn't become disconnected
-			if participant.IsDisconnected() {
-				return
-			}
+		case <-participant.Disconnected():
+			return
 		case <-tokenTicker.C:
 			// refresh token with the first API Key/secret pair
 			if err := r.refreshToken(participant); err != nil {
 				pLogger.Errorw("could not refresh token", err, "connID", requestSource.ConnectionID())
 			}
 		case obj := <-requestSource.ReadChan():
-			// In single node mode, the request source is directly tied to the signal message channel
-			// this means ICE restart isn't possible in single node mode
 			if obj == nil {
 				if room.GetParticipantRequestSource(participant.Identity()) == requestSource {
 					participant.HandleSignalSourceClose()
@@ -698,14 +764,30 @@ func (r *RoomManager) MutePublishedTrack(ctx context.Context, req *livekit.MuteR
 }
 
 func (r *RoomManager) UpdateParticipant(ctx context.Context, req *livekit.UpdateParticipantRequest) (*livekit.ParticipantInfo, error) {
-	room, participant, err := r.roomAndParticipantForReq(ctx, req)
+	_, participant, err := r.roomAndParticipantForReq(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
 	participant.GetLogger().Debugw("updating participant",
-		"metadata", req.Metadata, "permission", req.Permission)
-	room.UpdateParticipantMetadata(participant, req.Name, req.Metadata)
+		"metadata", req.Metadata,
+		"permission", req.Permission,
+		"attributes", req.Attributes,
+	)
+	if err = participant.CheckMetadataLimits(req.Name, req.Metadata, req.Attributes); err != nil {
+		return nil, err
+	}
+
+	if req.Name != "" {
+		participant.SetName(req.Name)
+	}
+	if req.Metadata != "" {
+		participant.SetMetadata(req.Metadata)
+	}
+	if req.Attributes != nil {
+		participant.SetAttributes(req.Attributes)
+	}
+
 	if req.Permission != nil {
 		participant.SetPermission(req.Permission)
 	}
@@ -752,13 +834,18 @@ func (r *RoomManager) SendData(ctx context.Context, req *livekit.SendDataRequest
 	}
 
 	room.Logger.Debugw("api send data", "size", len(req.Data))
-	up := &livekit.UserPacket{
-		Payload:               req.Data,
-		DestinationSids:       req.DestinationSids,
+	room.SendDataPacket(&livekit.DataPacket{
+		Kind:                  req.Kind,
 		DestinationIdentities: req.DestinationIdentities,
-		Topic:                 req.Topic,
-	}
-	room.SendDataPacket(up, req.Kind)
+		Value: &livekit.DataPacket_User{
+			User: &livekit.UserPacket{
+				Payload:               req.Data,
+				DestinationSids:       req.DestinationSids,
+				DestinationIdentities: req.DestinationIdentities,
+				Topic:                 req.Topic,
+			},
+		},
+	}, req.Kind)
 	return &livekit.SendDataResponse{}, nil
 }
 
@@ -773,6 +860,52 @@ func (r *RoomManager) UpdateRoomMetadata(ctx context.Context, req *livekit.Updat
 	// wait till the update is applied
 	<-done
 	return room.ToProto(), nil
+}
+
+func (r *RoomManager) ListDispatch(ctx context.Context, req *livekit.ListAgentDispatchRequest) (*livekit.ListAgentDispatchResponse, error) {
+	room := r.GetRoom(ctx, livekit.RoomName(req.Room))
+	if room == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	disp, err := room.GetAgentDispatches(req.DispatchId)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &livekit.ListAgentDispatchResponse{
+		AgentDispatches: disp,
+	}
+
+	return ret, nil
+}
+
+func (r *RoomManager) CreateDispatch(ctx context.Context, req *livekit.AgentDispatch) (*livekit.AgentDispatch, error) {
+	room := r.GetRoom(ctx, livekit.RoomName(req.Room))
+	if room == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	disp, err := room.AddAgentDispatch(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return disp, nil
+}
+
+func (r *RoomManager) DeleteDispatch(ctx context.Context, req *livekit.DeleteAgentDispatchRequest) (*livekit.AgentDispatch, error) {
+	room := r.GetRoom(ctx, livekit.RoomName(req.Room))
+	if room == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	disp, err := room.DeleteAgentDispatch(req.DispatchId)
+	if err != nil {
+		return nil, err
+	}
+
+	return disp, nil
 }
 
 func (r *RoomManager) iceServersForParticipant(apiKey string, participant types.LocalParticipant, tlsOnly bool) []*livekit.ICEServer {
@@ -856,6 +989,7 @@ func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
 		SetIdentity(string(participant.Identity())).
 		SetValidFor(tokenDefaultTTL).
 		SetMetadata(grants.Metadata).
+		SetAttributes(grants.Attributes).
 		AddGrant(grants.Video)
 	jwt, err := token.ToJWT()
 	if err == nil {
@@ -868,24 +1002,14 @@ func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
 	return nil
 }
 
-func (r *RoomManager) setIceConfig(participant types.LocalParticipant) *livekit.ICEConfig {
-	iceConfig := r.getIceConfig(participant)
-	if iceConfig == nil {
-		return &livekit.ICEConfig{}
-	}
+func (r *RoomManager) setIceConfig(roomName livekit.RoomName, participant types.LocalParticipant) *livekit.ICEConfig {
+	iceConfig := r.getIceConfig(roomName, participant)
 	participant.SetICEConfig(iceConfig)
 	return iceConfig
 }
 
-func (r *RoomManager) getIceConfig(participant types.LocalParticipant) *livekit.ICEConfig {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	iceConfigCacheEntry, ok := r.iceConfigCache[participant.Identity()]
-	if !ok || time.Since(iceConfigCacheEntry.modifiedAt) > iceConfigTTL {
-		delete(r.iceConfigCache, participant.Identity())
-		return nil
-	}
-	return iceConfigCacheEntry.iceConfig
+func (r *RoomManager) getIceConfig(roomName livekit.RoomName, participant types.LocalParticipant) *livekit.ICEConfig {
+	return r.iceConfigCache.Get(iceConfigCacheKey{roomName, participant.Identity()})
 }
 
 func (r *RoomManager) getFirstKeyPair() (string, string, error) {

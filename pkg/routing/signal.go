@@ -28,7 +28,7 @@ import (
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/psrpc"
 	"github.com/livekit/psrpc/pkg/middleware"
 )
@@ -55,7 +55,7 @@ func NewSignalClient(nodeID livekit.NodeID, bus psrpc.MessageBus, config config.
 	c, err := rpc.NewTypedSignalClient(
 		nodeID,
 		bus,
-		middleware.WithClientMetrics(prometheus.PSRPCMetricsObserver{}),
+		middleware.WithClientMetrics(rpc.PSRPCMetricsObserver{}),
 		psrpc.WithClientChannelSize(config.StreamBufferSize),
 	)
 	if err != nil {
@@ -84,7 +84,7 @@ func (r *signalClient) StartParticipantSignal(
 	resSource MessageSource,
 	err error,
 ) {
-	connectionID = livekit.ConnectionID(utils.NewGuid("CO_"))
+	connectionID = livekit.ConnectionID(guid.New("CO_"))
 	ss, err := pi.ToStartSession(roomName, connectionID)
 	if err != nil {
 		return

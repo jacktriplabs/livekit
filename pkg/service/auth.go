@@ -34,6 +34,11 @@ const (
 
 type grantsKey struct{}
 
+type grantsValue struct {
+	claims *auth.ClaimGrants
+	apiKey string
+}
+
 var (
 	ErrPermissionDenied          = errors.New("permissions denied")
 	ErrMissingAuthorization      = errors.New("invalid authorization header. Must start with " + bearerPrefix)
@@ -93,23 +98,45 @@ func (m *APIKeyAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request,
 
 		// set grants in context
 		ctx := r.Context()
-		r = r.WithContext(context.WithValue(ctx, grantsKey{}, grants))
+		r = r.WithContext(context.WithValue(ctx, grantsKey{}, &grantsValue{
+			claims: grants,
+			apiKey: v.APIKey(),
+		}))
 	}
 
 	next.ServeHTTP(w, r)
 }
 
+func WithAPIKey(ctx context.Context, grants *auth.ClaimGrants, apiKey string) context.Context {
+	return context.WithValue(ctx, grantsKey{}, &grantsValue{
+		claims: grants,
+		apiKey: apiKey,
+	})
+}
+
 func GetGrants(ctx context.Context) *auth.ClaimGrants {
 	val := ctx.Value(grantsKey{})
-	claims, ok := val.(*auth.ClaimGrants)
+	v, ok := val.(*grantsValue)
 	if !ok {
 		return nil
 	}
-	return claims
+	return v.claims
 }
 
-func WithGrants(ctx context.Context, grants *auth.ClaimGrants) context.Context {
-	return context.WithValue(ctx, grantsKey{}, grants)
+func GetAPIKey(ctx context.Context) string {
+	val := ctx.Value(grantsKey{})
+	v, ok := val.(*grantsValue)
+	if !ok {
+		return ""
+	}
+	return v.apiKey
+}
+
+func WithGrants(ctx context.Context, grants *auth.ClaimGrants, apiKey string) context.Context {
+	return context.WithValue(ctx, grantsKey{}, &grantsValue{
+		claims: grants,
+		apiKey: apiKey,
+	})
 }
 
 func SetAuthorizationToken(r *http.Request, token string) {
@@ -152,6 +179,16 @@ func EnsureCreatePermission(ctx context.Context) error {
 	return nil
 }
 
+func GetRoomConfiguration(ctx context.Context) string {
+
+	claims := GetGrants(ctx)
+
+	if claims == nil || claims.Video == nil {
+		return ""
+	}
+	return claims.Video.RoomConfiguration
+}
+
 func EnsureListPermission(ctx context.Context) error {
 	claims := GetGrants(ctx)
 	if claims == nil || claims.Video == nil || !claims.Video.RoomList {
@@ -171,6 +208,22 @@ func EnsureRecordPermission(ctx context.Context) error {
 func EnsureIngressAdminPermission(ctx context.Context) error {
 	claims := GetGrants(ctx)
 	if claims == nil || claims.Video == nil || !claims.Video.IngressAdmin {
+		return ErrPermissionDenied
+	}
+	return nil
+}
+
+func EnsureSIPAdminPermission(ctx context.Context) error {
+	claims := GetGrants(ctx)
+	if claims == nil || claims.SIP == nil || !claims.SIP.Admin {
+		return ErrPermissionDenied
+	}
+	return nil
+}
+
+func EnsureSIPCallPermission(ctx context.Context) error {
+	claims := GetGrants(ctx)
+	if claims == nil || claims.SIP == nil || !claims.SIP.Call {
 		return ErrPermissionDenied
 	}
 	return nil

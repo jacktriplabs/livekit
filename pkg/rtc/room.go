@@ -16,10 +16,9 @@ package rtc
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -29,13 +28,14 @@ import (
 	"golang.org/x/exp/maps"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/pion/sctp"
-
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
+	"github.com/livekit/psrpc"
 
+	"github.com/livekit/livekit-server/pkg/agent"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
@@ -47,8 +47,7 @@ import (
 )
 
 const (
-	DefaultEmptyTimeout       = 5 * 60 // 5m
-	AudioLevelQuantization    = 8      // ideally power of 2 to minimize float decimal
+	AudioLevelQuantization    = 8 // ideally power of 2 to minimize float decimal
 	invAudioLevelQuantization = 1.0 / AudioLevelQuantization
 	subscriberUpdateInterval  = 3 * time.Second
 
@@ -59,9 +58,20 @@ const (
 
 var (
 	// var to allow unit test override
-	RoomDepartureGrace uint32 = 20
-	roomUpdateInterval        = 5 * time.Second // frequency to update room participant counts
+	roomUpdateInterval = 5 * time.Second // frequency to update room participant counts
+
+	ErrJobShutdownTimeout = psrpc.NewErrorf(psrpc.DeadlineExceeded, "timed out waiting for agent job to shutdown")
 )
+
+// Duplicate the service.AgentStore interface to avoid a rtc -> service -> rtc import cycle
+type AgentStore interface {
+	StoreAgentDispatch(ctx context.Context, dispatch *livekit.AgentDispatch) error
+	DeleteAgentDispatch(ctx context.Context, dispatch *livekit.AgentDispatch) error
+	ListAgentDispatches(ctx context.Context, roomName livekit.RoomName) ([]*livekit.AgentDispatch, error)
+
+	StoreAgentJob(ctx context.Context, job *livekit.Job) error
+	DeleteAgentJob(ctx context.Context, job *livekit.Job) error
+}
 
 type broadcastOptions struct {
 	skipSource bool
@@ -87,7 +97,7 @@ type Room struct {
 	joinedAt atomic.Int64
 	// time that the last participant left the room
 	leftAt atomic.Int64
-	holds    atomic.Int32
+	holds  atomic.Int32
 
 	lock sync.RWMutex
 
@@ -96,22 +106,24 @@ type Room struct {
 	protoProxy *utils.ProtoProxy[*livekit.Room]
 	Logger     logger.Logger
 
-	config         WebRTCConfig
-	audioConfig    *config.AudioConfig
-	serverInfo     *livekit.ServerInfo
-	telemetry      telemetry.TelemetryService
-	egressLauncher EgressLauncher
-	trackManager   *RoomTrackManager
+	config          WebRTCConfig
+	audioConfig     *config.AudioConfig
+	serverInfo      *livekit.ServerInfo
+	telemetry       telemetry.TelemetryService
+	egressLauncher  EgressLauncher
+	trackManager    *RoomTrackManager
+	agentDispatches map[string]*agentDispatch
 
 	// agents
-	agentClient            AgentClient
-	publisherAgentsEnabled bool
+	agentClient agent.Client
+	agentStore  AgentStore
 
 	// map of identity -> Participant
 	participants              map[livekit.ParticipantIdentity]types.LocalParticipant
 	participantOpts           map[livekit.ParticipantIdentity]*ParticipantOptions
 	participantRequestSources map[livekit.ParticipantIdentity]routing.MessageSource
 	hasPublished              map[livekit.ParticipantIdentity]bool
+	agentParticpants          map[livekit.ParticipantIdentity]*agentJob
 	bufferFactory             *buffer.FactoryOfBufferFactory
 
 	// batch update participant info for non-publishers
@@ -135,18 +147,102 @@ type ParticipantOptions struct {
 	AutoSubscribe bool
 }
 
+type agentDispatch struct {
+	*livekit.AgentDispatch
+	lock    sync.Mutex
+	pending map[chan struct{}]struct{}
+}
+
+type agentJob struct {
+	*livekit.Job
+	lock sync.Mutex
+	done chan struct{}
+}
+
+// This provides utilities attached the agent dispatch to ensure that all pending jobs are created
+// before terminating jobs attached to an agent dispatch. This avoids a race that could cause some pending jobs
+// to not be terminated when a dispatch is deleted.
+func newAgentDispatch(ad *livekit.AgentDispatch) *agentDispatch {
+	return &agentDispatch{
+		AgentDispatch: ad,
+		pending:       make(map[chan struct{}]struct{}),
+	}
+}
+
+func (ad *agentDispatch) jobsLaunching() (jobsLaunched func()) {
+	ad.lock.Lock()
+	c := make(chan struct{})
+	ad.pending[c] = struct{}{}
+	ad.lock.Unlock()
+
+	return func() {
+		close(c)
+		ad.lock.Lock()
+		delete(ad.pending, c)
+		ad.lock.Unlock()
+	}
+}
+
+func (ad *agentDispatch) waitForPendingJobs() {
+	ad.lock.Lock()
+	cs := maps.Keys(ad.pending)
+	ad.lock.Unlock()
+
+	for _, c := range cs {
+		<-c
+	}
+}
+
+// This provides utilities to ensure that an agent left the room when killing a job
+func newAgentJob(j *livekit.Job) *agentJob {
+	return &agentJob{
+		Job:  j,
+		done: make(chan struct{}),
+	}
+}
+
+func (j *agentJob) participantLeft() {
+	j.lock.Lock()
+	if j.done != nil {
+		close(j.done)
+		j.done = nil
+	}
+	j.lock.Unlock()
+}
+
+func (j *agentJob) waitForParticipantLeaving() error {
+	var done chan struct{}
+
+	j.lock.Lock()
+	done = j.done
+	j.lock.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+			return nil
+		case <-time.After(3 * time.Second):
+			return ErrJobShutdownTimeout
+		}
+	}
+
+	return nil
+}
+
 func NewRoom(
 	room *livekit.Room,
 	internal *livekit.RoomInternal,
 	config WebRTCConfig,
+	roomConfig config.RoomConfig,
 	audioConfig *config.AudioConfig,
 	serverInfo *livekit.ServerInfo,
 	telemetry telemetry.TelemetryService,
-	agentClient AgentClient,
+	agentClient agent.Client,
+	agentStore AgentStore,
 	egressLauncher EgressLauncher,
 ) *Room {
 	r := &Room{
-		protoRoom: proto.Clone(room).(*livekit.Room),
+		protoRoom: utils.CloneProto(room),
 		internal:  internal,
 		Logger: LoggerWithRoom(
 			logger.GetLogger().WithComponent(sutils.ComponentRoom),
@@ -158,13 +254,16 @@ func NewRoom(
 		telemetry:                            telemetry,
 		egressLauncher:                       egressLauncher,
 		agentClient:                          agentClient,
+		agentStore:                           agentStore,
+		agentDispatches:                      make(map[string]*agentDispatch),
 		trackManager:                         NewRoomTrackManager(),
 		serverInfo:                           serverInfo,
 		participants:                         make(map[livekit.ParticipantIdentity]types.LocalParticipant),
 		participantOpts:                      make(map[livekit.ParticipantIdentity]*ParticipantOptions),
 		participantRequestSources:            make(map[livekit.ParticipantIdentity]routing.MessageSource),
 		hasPublished:                         make(map[livekit.ParticipantIdentity]bool),
-		bufferFactory:                        buffer.NewFactoryOfBufferFactory(config.Receiver.PacketBufferSize),
+		agentParticpants:                     make(map[livekit.ParticipantIdentity]*agentJob),
+		bufferFactory:                        buffer.NewFactoryOfBufferFactory(config.Receiver.PacketBufferSizeVideo, config.Receiver.PacketBufferSizeAudio),
 		batchedUpdates:                       make(map[livekit.ParticipantIdentity]*participantUpdate),
 		closed:                               make(chan struct{}),
 		trailer:                              []byte(utils.RandomSecret()),
@@ -172,28 +271,20 @@ func NewRoom(
 		disconnectSignalOnResumeNoMessagesParticipants: make(map[livekit.ParticipantIdentity]*disconnectSignalOnResumeNoMessages),
 	}
 
-	r.protoProxy = utils.NewProtoProxy[*livekit.Room](roomUpdateInterval, r.updateProto)
 	if r.protoRoom.EmptyTimeout == 0 {
-		r.protoRoom.EmptyTimeout = DefaultEmptyTimeout
+		r.protoRoom.EmptyTimeout = roomConfig.EmptyTimeout
+	}
+	if r.protoRoom.DepartureTimeout == 0 {
+		r.protoRoom.DepartureTimeout = roomConfig.DepartureTimeout
 	}
 	if r.protoRoom.CreationTime == 0 {
 		r.protoRoom.CreationTime = time.Now().Unix()
 	}
+	r.protoProxy = utils.NewProtoProxy[*livekit.Room](roomUpdateInterval, r.updateProto)
 
-	if agentClient != nil {
-		go func() {
-			res := r.agentClient.CheckEnabled(context.Background(), &rpc.CheckEnabledRequest{})
-			if res.PublisherEnabled {
-				r.lock.Lock()
-				r.publisherAgentsEnabled = true
-				// if there are already published tracks, start the agents
-				for identity := range r.hasPublished {
-					r.launchPublisherAgent(r.participants[identity])
-				}
-				r.lock.Unlock()
-			}
-		}()
-	}
+	r.createAgentDispatchesFromRoomAgent()
+
+	r.launchRoomAgents(maps.Values(r.agentDispatches))
 
 	go r.audioUpdateWorker()
 	go r.connectionQualityWorker()
@@ -331,10 +422,10 @@ func (r *Room) Join(participant types.LocalParticipant, requestSource routing.Me
 	if r.participants[participant.Identity()] != nil {
 		return ErrAlreadyJoined
 	}
-	if r.protoRoom.MaxParticipants > 0 && !participant.IsRecorder() {
+	if r.protoRoom.MaxParticipants > 0 && !participant.IsDependent() {
 		numParticipants := uint32(0)
 		for _, p := range r.participants {
-			if !p.IsRecorder() {
+			if !p.IsDependent() {
 				numParticipants++
 			}
 		}
@@ -360,10 +451,10 @@ func (r *Room) Join(participant types.LocalParticipant, requestSource routing.Me
 			meta := &livekit.AnalyticsClientMeta{
 				ClientConnectTime: uint32(time.Since(p.ConnectedAt()).Milliseconds()),
 			}
-			cds := p.GetICEConnectionDetails()
-			for _, cd := range cds {
-				if cd.Type != types.ICEConnectionTypeUnknown {
-					meta.ConnectionType = string(cd.Type)
+			infos := p.GetICEConnectionInfo()
+			for _, info := range infos {
+				if info.Type != types.ICEConnectionTypeUnknown {
+					meta.ConnectionType = string(info.Type)
 					break
 				}
 			}
@@ -374,7 +465,7 @@ func (r *Room) Join(participant types.LocalParticipant, requestSource routing.Me
 				false,
 			)
 
-			p.GetLogger().Infow("participant active", connectionDetailsFields(cds)...)
+			p.GetLogger().Infow("participant active", connectionDetailsFields(infos)...)
 		} else if state == livekit.ParticipantInfo_DISCONNECTED {
 			// remove participant from room
 			// participant should already be closed and have a close reason, so NONE is fine here
@@ -387,6 +478,7 @@ func (r *Room) Join(participant types.LocalParticipant, requestSource routing.Me
 	participant.OnTrackUnpublished(r.onTrackUnpublished)
 	participant.OnParticipantUpdate(r.onParticipantUpdate)
 	participant.OnDataPacket(r.onDataPacket)
+	participant.OnMetrics(r.onMetrics)
 	participant.OnSubscribeStatusChanged(func(publisherID livekit.ParticipantID, subscribed bool) {
 		if subscribed {
 			pub := r.GetParticipantByID(publisherID)
@@ -492,7 +584,14 @@ func (r *Room) GetParticipantRequestSource(identity livekit.ParticipantIdentity)
 	return r.participantRequestSources[identity]
 }
 
-func (r *Room) ResumeParticipant(p types.LocalParticipant, requestSource routing.MessageSource, responseSink routing.MessageSink, iceServers []*livekit.ICEServer, reason livekit.ReconnectReason) error {
+func (r *Room) ResumeParticipant(
+	p types.LocalParticipant,
+	requestSource routing.MessageSource,
+	responseSink routing.MessageSink,
+	iceConfig *livekit.ICEConfig,
+	iceServers []*livekit.ICEServer,
+	reason livekit.ReconnectReason,
+) error {
 	r.ReplaceParticipantRequestSource(p.Identity(), requestSource)
 	// close previous sink, and link to new one
 	p.CloseSignalConnection(types.SignallingCloseReasonResume)
@@ -534,7 +633,7 @@ func (r *Room) ResumeParticipant(p types.LocalParticipant, requestSource routing
 	}
 
 	_ = p.SendRoomUpdate(r.ToProto())
-	p.ICERestart(nil)
+	p.ICERestart(iceConfig)
 
 	// check for simulated signal disconnect on resume
 	r.simulationLock.Lock()
@@ -563,10 +662,13 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity, pID livek
 		return
 	}
 
+	agentJob := r.agentParticpants[identity]
+
 	delete(r.participants, identity)
 	delete(r.participantOpts, identity)
 	delete(r.participantRequestSources, identity)
 	delete(r.hasPublished, identity)
+	delete(r.agentParticpants, identity)
 	if !p.Hidden() {
 		r.protoRoom.NumParticipants--
 	}
@@ -590,7 +692,7 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity, pID livek
 	r.protoProxy.MarkDirty(immediateChange)
 
 	if !p.HasConnected() {
-		fields := append(connectionDetailsFields(p.GetICEConnectionDetails()),
+		fields := append(connectionDetailsFields(p.GetICEConnectionInfo()),
 			"reason", reason.String(),
 		)
 		p.GetLogger().Infow("removing participant without connection", fields...)
@@ -604,12 +706,24 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity, pID livek
 		r.trackManager.RemoveTrack(t)
 	}
 
+	if agentJob != nil {
+		agentJob.participantLeft()
+
+		go func() {
+			_, err := r.agentClient.TerminateJob(context.Background(), agentJob.Id, rpc.JobTerminateReason_AGENT_LEFT_ROOM)
+			if err != nil {
+				r.Logger.Infow("failed sending TerminateJob RPC", "error", err, "jobID", agentJob.Id, "participant", identity)
+			}
+		}()
+	}
+
 	p.OnTrackUpdated(nil)
 	p.OnTrackPublished(nil)
 	p.OnTrackUnpublished(nil)
 	p.OnStateChange(nil)
 	p.OnParticipantUpdate(nil)
 	p.OnDataPacket(nil)
+	p.OnMetrics(nil)
 	p.OnSubscribeStatusChanged(nil)
 
 	// close participant as well
@@ -707,17 +821,13 @@ func (r *Room) SyncState(participant types.LocalParticipant, state *livekit.Sync
 }
 
 func (r *Room) UpdateSubscriptionPermission(participant types.LocalParticipant, subscriptionPermission *livekit.SubscriptionPermission) error {
-	if err := participant.UpdateSubscriptionPermission(subscriptionPermission, utils.TimedVersion{}, r.GetParticipant, r.GetParticipantByID); err != nil {
+	if err := participant.UpdateSubscriptionPermission(subscriptionPermission, utils.TimedVersion(0), r.GetParticipantByID); err != nil {
 		return err
 	}
 	for _, track := range participant.GetPublishedTracks() {
 		r.trackManager.NotifyTrackChanged(track.ID())
 	}
 	return nil
-}
-
-func (r *Room) UpdateVideoLayers(participant types.Participant, updateVideoLayers *livekit.UpdateVideoLayers) error {
-	return participant.UpdateVideoLayers(updateVideoLayers)
 }
 
 func (r *Room) ResolveMediaTrackForSubscriber(subIdentity livekit.ParticipantIdentity, trackID livekit.TrackID) types.MediaResolverResult {
@@ -763,7 +873,7 @@ func (r *Room) CloseIfEmpty() {
 	}
 
 	for _, p := range r.participants {
-		if !p.IsRecorder() {
+		if !p.IsDependent() {
 			r.lock.Unlock()
 			return
 		}
@@ -774,7 +884,7 @@ func (r *Room) CloseIfEmpty() {
 	if r.FirstJoinedAt() > 0 && r.LastLeftAt() > 0 {
 		elapsed = time.Now().Unix() - r.LastLeftAt()
 		// need to give time in case participant is reconnecting
-		timeout = RoomDepartureGrace
+		timeout = r.protoRoom.DepartureTimeout
 	} else {
 		elapsed = time.Now().Unix() - r.protoRoom.CreationTime
 		timeout = r.protoRoom.EmptyTimeout
@@ -782,7 +892,7 @@ func (r *Room) CloseIfEmpty() {
 	r.lock.Unlock()
 
 	if elapsed >= int64(timeout) {
-		r.Close(types.ParticipantCloseReasonNone)
+		r.Close(types.ParticipantCloseReasonRoomClosed)
 	}
 }
 
@@ -818,14 +928,8 @@ func (r *Room) OnParticipantChanged(f func(participant types.LocalParticipant)) 
 	r.onParticipantChanged = f
 }
 
-func (r *Room) SendDataPacket(up *livekit.UserPacket, kind livekit.DataPacket_Kind) {
-	dp := &livekit.DataPacket{
-		Kind: kind,
-		Value: &livekit.DataPacket_User{
-			User: up,
-		},
-	}
-	r.onDataPacket(nil, dp)
+func (r *Room) SendDataPacket(dp *livekit.DataPacket, kind livekit.DataPacket_Kind) {
+	r.onDataPacket(nil, kind, dp)
 }
 
 func (r *Room) SetMetadata(metadata string) <-chan struct{} {
@@ -833,15 +937,6 @@ func (r *Room) SetMetadata(metadata string) <-chan struct{} {
 	r.protoRoom.Metadata = metadata
 	r.lock.Unlock()
 	return r.protoProxy.MarkDirty(true)
-}
-
-func (r *Room) UpdateParticipantMetadata(participant types.LocalParticipant, name string, metadata string) {
-	if metadata != "" {
-		participant.SetMetadata(metadata)
-	}
-	if name != "" {
-		participant.SetName(name)
-	}
 }
 
 func (r *Room) sendRoomUpdate() {
@@ -857,6 +952,91 @@ func (r *Room) sendRoomUpdate() {
 			r.Logger.Warnw("failed to send room update", err, "participant", p.Identity())
 		}
 	}
+}
+
+func (r *Room) GetAgentDispatches(dispatchID string) ([]*livekit.AgentDispatch, error) {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	var ret []*livekit.AgentDispatch
+
+	for _, ad := range r.agentDispatches {
+		if dispatchID == "" || ad.Id == dispatchID {
+			ret = append(ret, utils.CloneProto(ad.AgentDispatch))
+		}
+	}
+
+	return ret, nil
+}
+
+func (r *Room) AddAgentDispatch(dispatch *livekit.AgentDispatch) (*livekit.AgentDispatch, error) {
+	ad, err := r.createAgentDispatch(dispatch)
+	if err != nil {
+		return nil, err
+	}
+
+	r.launchRoomAgents([]*agentDispatch{ad})
+
+	r.lock.RLock()
+	// launchPublisherAgents starts a goroutine to send requests, so is safe to call locked
+	for _, p := range r.participants {
+		r.launchPublisherAgents([]*agentDispatch{ad}, p)
+	}
+	r.lock.RUnlock()
+
+	return ad.AgentDispatch, nil
+}
+
+func (r *Room) DeleteAgentDispatch(dispatchID string) (*livekit.AgentDispatch, error) {
+	r.lock.Lock()
+	ad := r.agentDispatches[dispatchID]
+	if ad == nil {
+		r.lock.Unlock()
+		return nil, psrpc.NewErrorf(psrpc.NotFound, "dispatch ID not found")
+	}
+
+	delete(r.agentDispatches, dispatchID)
+	r.lock.Unlock()
+
+	// Should Delete be synchronous instead?
+	go func() {
+		ad.waitForPendingJobs()
+
+		var jobs []*livekit.Job
+		r.lock.RLock()
+		if ad.State != nil {
+			jobs = ad.State.Jobs
+		}
+		r.lock.RUnlock()
+
+		for _, j := range jobs {
+			state, err := r.agentClient.TerminateJob(context.Background(), j.Id, rpc.JobTerminateReason_TERMINATION_REQUESTED)
+			if err != nil {
+				continue
+			}
+			if state.ParticipantIdentity != "" {
+				r.lock.RLock()
+				agentJob := r.agentParticpants[livekit.ParticipantIdentity(state.ParticipantIdentity)]
+				p := r.participants[livekit.ParticipantIdentity(state.ParticipantIdentity)]
+				r.lock.RUnlock()
+
+				if p != nil {
+					if agentJob != nil {
+						err := agentJob.waitForParticipantLeaving()
+						if err == ErrJobShutdownTimeout {
+							r.Logger.Infow("Agent Worker did not disconnect after 3s")
+						}
+					}
+					r.RemoveParticipant(p.Identity(), p.ID(), types.ParticipantCloseReasonServiceRequestRemoveParticipant)
+				}
+			}
+			r.lock.Lock()
+			j.State = state
+			r.lock.Unlock()
+		}
+	}()
+
+	return ad.AgentDispatch, nil
 }
 
 func (r *Room) OnRoomUpdated(f func()) {
@@ -957,6 +1137,8 @@ func (r *Room) createJoinResponseLocked(participant types.LocalParticipant, iceS
 		}
 	}
 
+	iceConfig := participant.GetICEConfig()
+	hasICEFallback := iceConfig.GetPreferencePublisher() != livekit.ICECandidateType_ICT_NONE || iceConfig.GetPreferenceSubscriber() != livekit.ICECandidateType_ICT_NONE
 	return &livekit.JoinResponse{
 		Room:              r.ToProto(),
 		Participant:       participant.ToProto(),
@@ -966,12 +1148,14 @@ func (r *Room) createJoinResponseLocked(participant types.LocalParticipant, iceS
 		SubscriberPrimary:   participant.SubscriberAsPrimary(),
 		ClientConfiguration: participant.GetClientConfiguration(),
 		// sane defaults for ping interval & timeout
-		PingInterval:  PingIntervalSeconds,
-		PingTimeout:   PingTimeoutSeconds,
-		ServerInfo:    r.serverInfo,
-		ServerVersion: r.serverInfo.Version,
-		ServerRegion:  r.serverInfo.Region,
-		SifTrailer:    r.trailer,
+		PingInterval:         PingIntervalSeconds,
+		PingTimeout:          PingTimeoutSeconds,
+		ServerInfo:           r.serverInfo,
+		ServerVersion:        r.serverInfo.Version,
+		ServerRegion:         r.serverInfo.Region,
+		SifTrailer:           r.trailer,
+		EnabledPublishCodecs: participant.GetEnabledPublishCodecs(),
+		FastPublish:          participant.CanPublish() && !hasICEFallback,
 	}
 }
 
@@ -1016,13 +1200,12 @@ func (r *Room) onTrackPublished(participant types.LocalParticipant, track types.
 	r.lock.Lock()
 	hasPublished := r.hasPublished[participant.Identity()]
 	r.hasPublished[participant.Identity()] = true
-	publisherAgentsEnabled := r.publisherAgentsEnabled
 	r.lock.Unlock()
 
 	if !hasPublished {
-		if publisherAgentsEnabled {
-			r.launchPublisherAgent(participant)
-		}
+		r.lock.RLock()
+		r.launchPublisherAgents(maps.Values(r.agentDispatches), participant)
+		r.lock.RUnlock()
 		if r.internal != nil && r.internal.ParticipantEgress != nil {
 			go func() {
 				if err := StartParticipantEgress(
@@ -1083,8 +1266,12 @@ func (r *Room) onParticipantUpdate(p types.LocalParticipant) {
 	}
 }
 
-func (r *Room) onDataPacket(source types.LocalParticipant, dp *livekit.DataPacket) {
-	BroadcastDataPacketForRoom(r, source, dp, r.Logger)
+func (r *Room) onDataPacket(source types.LocalParticipant, kind livekit.DataPacket_Kind, dp *livekit.DataPacket) {
+	BroadcastDataPacketForRoom(r, source, kind, dp, r.Logger)
+}
+
+func (r *Room) onMetrics(source types.LocalParticipant, dp *livekit.DataPacket) {
+	BroadcastMetricsForRoom(r, source, dp, r.Logger)
 }
 
 func (r *Room) subscribeToExistingTracks(p types.LocalParticipant) {
@@ -1169,33 +1356,6 @@ func (r *Room) sendParticipantUpdates(updates []*participantUpdate) {
 	}
 }
 
-// for protocol 2, send all active speakers
-func (r *Room) sendActiveSpeakers(speakers []*livekit.SpeakerInfo) {
-	dp := &livekit.DataPacket{
-		Kind: livekit.DataPacket_LOSSY,
-		Value: &livekit.DataPacket_Speaker{
-			Speaker: &livekit.ActiveSpeakerUpdate{
-				Speakers: speakers,
-			},
-		},
-	}
-
-	var dpData []byte
-	for _, p := range r.GetParticipants() {
-		if p.ProtocolVersion().HandlesDataPackets() && !p.ProtocolVersion().SupportsSpeakerChanged() {
-			if dpData == nil {
-				var err error
-				dpData, err = proto.Marshal(dp)
-				if err != nil {
-					r.Logger.Errorw("failed to marshal ActiveSpeaker data packet", err)
-					return
-				}
-			}
-			_ = p.SendDataPacket(dp, dpData)
-		}
-	}
-}
-
 // for protocol 3, send only changed updates
 func (r *Room) sendSpeakerChanges(speakers []*livekit.SpeakerInfo) {
 	for _, p := range r.GetParticipants() {
@@ -1269,13 +1429,13 @@ func (r *Room) pushAndDequeueUpdates(
 
 func (r *Room) updateProto() *livekit.Room {
 	r.lock.RLock()
-	room := proto.Clone(r.protoRoom).(*livekit.Room)
+	room := utils.CloneProto(r.protoRoom)
 	r.lock.RUnlock()
 
 	room.NumPublishers = 0
 	room.NumParticipants = 0
 	for _, p := range r.GetParticipants() {
-		if !p.IsRecorder() {
+		if !p.IsDependent() {
 			room.NumParticipants++
 		}
 		if p.IsPublisher() {
@@ -1335,7 +1495,7 @@ func (r *Room) audioUpdateWorker() {
 		// changedSpeakers need to include previous speakers that are no longer speaking
 		for sid, speaker := range lastActiveMap {
 			if nextActiveMap[sid] == nil {
-				inactiveSpeaker := proto.Clone(speaker).(*livekit.SpeakerInfo)
+				inactiveSpeaker := utils.CloneProto(speaker)
 				inactiveSpeaker.Level = 0
 				inactiveSpeaker.Active = false
 				changedSpeakers = append(changedSpeakers, inactiveSpeaker)
@@ -1344,7 +1504,6 @@ func (r *Room) audioUpdateWorker() {
 
 		// see if an update is needed
 		if len(changedSpeakers) > 0 {
-			r.sendActiveSpeakers(activeSpeakers)
 			r.sendSpeakerChanges(changedSpeakers)
 		}
 
@@ -1459,19 +1618,61 @@ func (r *Room) simulationCleanupWorker() {
 	}
 }
 
-func (r *Room) launchPublisherAgent(p types.Participant) {
-	if p == nil || p.IsRecorder() || p.IsAgent() {
+func (r *Room) launchRoomAgents(ads []*agentDispatch) {
+	if r.agentClient == nil {
 		return
 	}
 
-	go func() {
-		r.agentClient.JobRequest(context.Background(), &livekit.Job{
-			Id:          utils.NewGuid("JP_"),
-			Type:        livekit.JobType_JT_PUBLISHER,
-			Room:        r.ToProto(),
-			Participant: p.ToProto(),
-		})
-	}()
+	for _, ad := range ads {
+		done := ad.jobsLaunching()
+
+		go func() {
+			inc := r.agentClient.LaunchJob(context.Background(), &agent.JobRequest{
+				JobType:    livekit.JobType_JT_ROOM,
+				Room:       r.ToProto(),
+				Metadata:   ad.Metadata,
+				AgentName:  ad.AgentName,
+				DispatchId: ad.Id,
+			})
+			r.handleNewJobs(ad.AgentDispatch, inc)
+			done()
+		}()
+	}
+}
+
+func (r *Room) launchPublisherAgents(ads []*agentDispatch, p types.Participant) {
+	if p == nil || p.IsDependent() || r.agentClient == nil {
+		return
+	}
+
+	for _, ad := range ads {
+		done := ad.jobsLaunching()
+
+		go func() {
+			inc := r.agentClient.LaunchJob(context.Background(), &agent.JobRequest{
+				JobType:     livekit.JobType_JT_PUBLISHER,
+				Room:        r.ToProto(),
+				Participant: p.ToProto(),
+				Metadata:    ad.Metadata,
+				AgentName:   ad.AgentName,
+				DispatchId:  ad.Id,
+			})
+			r.handleNewJobs(ad.AgentDispatch, inc)
+			done()
+		}()
+	}
+}
+
+func (r *Room) handleNewJobs(ad *livekit.AgentDispatch, inc *sutils.IncrementalDispatcher[*livekit.Job]) {
+	inc.ForEach(func(job *livekit.Job) {
+		r.agentStore.StoreAgentJob(context.Background(), job)
+		r.lock.Lock()
+		ad.State.Jobs = append(ad.State.Jobs, job)
+		if job.State != nil && job.State.ParticipantIdentity != "" {
+			r.agentParticpants[livekit.ParticipantIdentity(job.State.ParticipantIdentity)] = newAgentJob(job)
+		}
+		r.lock.Unlock()
+	})
 }
 
 func (r *Room) DebugInfo() map[string]interface{} {
@@ -1491,42 +1692,91 @@ func (r *Room) DebugInfo() map[string]interface{} {
 	return info
 }
 
+func (r *Room) createAgentDispatch(dispatch *livekit.AgentDispatch) (*agentDispatch, error) {
+	dispatch.State = &livekit.AgentDispatchState{
+		CreatedAt: time.Now().UnixNano(),
+	}
+	ad := newAgentDispatch(dispatch)
+
+	r.lock.RLock()
+	r.agentDispatches[ad.Id] = ad
+	r.lock.RUnlock()
+	if r.agentStore != nil {
+		err := r.agentStore.StoreAgentDispatch(context.Background(), ad.AgentDispatch)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return ad, nil
+}
+
+func (r *Room) createAgentDispatchFromParams(agentName string, metadata string) (*agentDispatch, error) {
+	return r.createAgentDispatch(&livekit.AgentDispatch{
+		Id:        guid.New(guid.AgentDispatchPrefix),
+		AgentName: agentName,
+		Metadata:  metadata,
+		Room:      r.protoRoom.Name,
+	})
+}
+
+func (r *Room) createAgentDispatchesFromRoomAgent() {
+	if r.internal == nil {
+		return
+	}
+
+	roomDisp := r.internal.AgentDispatches
+	if len(roomDisp) == 0 {
+		// Backward compatibility: by default, start any agent in the empty JobName
+		roomDisp = []*livekit.RoomAgentDispatch{
+			&livekit.RoomAgentDispatch{},
+		}
+	}
+
+	for _, ag := range roomDisp {
+		_, err := r.createAgentDispatchFromParams(ag.AgentName, ag.Metadata)
+		if err != nil {
+			r.Logger.Warnw("failed storing room dispatch", err)
+		}
+	}
+}
+
 // ------------------------------------------------------------
 
-func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, dp *livekit.DataPacket, logger logger.Logger) {
+func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, kind livekit.DataPacket_Kind, dp *livekit.DataPacket, logger logger.Logger) {
+	dp.Kind = kind // backward compatibility
 	dest := dp.GetUser().GetDestinationSids()
-	var dpData []byte
-	destIdentities := dp.GetUser().GetDestinationIdentities()
+	if u := dp.GetUser(); u != nil {
+		if len(dp.DestinationIdentities) == 0 {
+			dp.DestinationIdentities = u.DestinationIdentities
+		} else {
+			u.DestinationIdentities = dp.DestinationIdentities
+		}
+		if dp.ParticipantIdentity != "" {
+			u.ParticipantIdentity = dp.ParticipantIdentity
+		} else {
+			dp.ParticipantIdentity = u.ParticipantIdentity
+		}
+	}
+	destIdentities := dp.DestinationIdentities
 
 	participants := r.GetLocalParticipants()
-	capacity := len(dest)
+	capacity := len(destIdentities)
+	if capacity == 0 {
+		capacity = len(dest)
+	}
 	if capacity == 0 {
 		capacity = len(participants)
 	}
 	destParticipants := make([]types.LocalParticipant, 0, capacity)
 
+	var dpData []byte
 	for _, op := range participants {
-		if op.State() != livekit.ParticipantInfo_ACTIVE {
-			continue
-		}
 		if source != nil && op.ID() == source.ID() {
 			continue
 		}
 		if len(dest) > 0 || len(destIdentities) > 0 {
-			found := false
-			for _, dID := range dest {
-				if op.ID() == livekit.ParticipantID(dID) {
-					found = true
-					break
-				}
-			}
-			for _, dIdentity := range destIdentities {
-				if op.Identity() == livekit.ParticipantIdentity(dIdentity) {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !slices.Contains(dest, string(op.ID())) && !slices.Contains(destIdentities, string(op.Identity())) {
 				continue
 			}
 		}
@@ -1542,48 +1792,61 @@ func BroadcastDataPacketForRoom(r types.Room, source types.LocalParticipant, dp 
 	}
 
 	utils.ParallelExec(destParticipants, dataForwardLoadBalanceThreshold, 1, func(op types.LocalParticipant) {
-		err := op.SendDataPacket(dp, dpData)
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, sctp.ErrStreamClosed) &&
-			!errors.Is(err, ErrTransportFailure) && !errors.Is(err, ErrDataChannelBufferFull) {
-			op.GetLogger().Infow("send data packet error", "error", err)
-		}
+		op.SendDataPacket(kind, dpData)
 	})
+}
+
+func BroadcastMetricsForRoom(r types.Room, source types.Participant, dp *livekit.DataPacket, logger logger.Logger) {
+	switch payload := dp.Value.(type) {
+	case *livekit.DataPacket_Metrics:
+		utils.ParallelExec(r.GetLocalParticipants(), dataForwardLoadBalanceThreshold, 1, func(op types.LocalParticipant) {
+			// echoing back to sender too
+			op.HandleMetrics(source.ID(), payload.Metrics)
+		})
+	default:
+	}
 }
 
 func IsCloseNotifySkippable(closeReason types.ParticipantCloseReason) bool {
 	return closeReason == types.ParticipantCloseReasonDuplicateIdentity
 }
 
-func connectionDetailsFields(cds []*types.ICEConnectionDetails) []interface{} {
+func connectionDetailsFields(infos []*types.ICEConnectionInfo) []interface{} {
 	var fields []interface{}
 	connectionType := types.ICEConnectionTypeUnknown
-	for _, cd := range cds {
-		candidates := make([]string, 0, len(cd.Remote)+len(cd.Local))
-		for _, c := range cd.Local {
+	for _, info := range infos {
+		candidates := make([]string, 0, len(info.Remote)+len(info.Local))
+		for _, c := range info.Local {
 			cStr := "[local]"
 			if c.Selected {
 				cStr += "[selected]"
 			} else if c.Filtered {
 				cStr += "[filtered]"
 			}
+			if c.Trickle {
+				cStr += "[trickle]"
+			}
 			cStr += " " + c.Local.String()
 			candidates = append(candidates, cStr)
 		}
-		for _, c := range cd.Remote {
+		for _, c := range info.Remote {
 			cStr := "[remote]"
 			if c.Selected {
 				cStr += "[selected]"
 			} else if c.Filtered {
 				cStr += "[filtered]"
 			}
+			if c.Trickle {
+				cStr += "[trickle]"
+			}
 			cStr += " " + c.Remote.String()
 			candidates = append(candidates, cStr)
 		}
 		if len(candidates) > 0 {
-			fields = append(fields, fmt.Sprintf("%sCandidates", strings.ToLower(cd.Transport.String())), candidates)
+			fields = append(fields, fmt.Sprintf("%sCandidates", strings.ToLower(info.Transport.String())), candidates)
 		}
-		if cd.Type != types.ICEConnectionTypeUnknown {
-			connectionType = cd.Type
+		if info.Type != types.ICEConnectionTypeUnknown {
+			connectionType = info.Type
 		}
 	}
 	fields = append(fields, "connectionType", connectionType)

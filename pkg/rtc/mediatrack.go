@@ -16,8 +16,10 @@ package rtc
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
@@ -27,44 +29,51 @@ import (
 	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/rtc/dynacast"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	util "github.com/livekit/mediatransportutil"
 )
 
 // MediaTrack represents a WebRTC track that needs to be forwarded
 // Implements MediaTrack and PublishedTrack interface
 type MediaTrack struct {
-	params      MediaTrackParams
-	numUpTracks atomic.Uint32
-	buffer      *buffer.Buffer
+	params         MediaTrackParams
+	numUpTracks    atomic.Uint32
+	buffer         *buffer.Buffer
+	everSubscribed atomic.Bool
 
 	*MediaTrackReceiver
 	*MediaLossProxy
 
-	dynacastManager *DynacastManager
+	dynacastManager *dynacast.DynacastManager
 
 	lock sync.RWMutex
+
+	rttFromXR atomic.Bool
 }
 
 type MediaTrackParams struct {
-	SignalCid           string
-	SdpCid              string
-	ParticipantID       livekit.ParticipantID
-	ParticipantIdentity livekit.ParticipantIdentity
-	ParticipantVersion  uint32
-	BufferFactory       *buffer.Factory
-	ReceiverConfig      ReceiverConfig
-	SubscriberConfig    DirectionConfig
-	PLIThrottleConfig   config.PLIThrottleConfig
-	AudioConfig         config.AudioConfig
-	VideoConfig         config.VideoConfig
-	Telemetry           telemetry.TelemetryService
-	Logger              logger.Logger
-	SimTracks           map[uint32]SimulcastTrackInfo
-	OnRTCP              func([]rtcp.Packet)
+	SignalCid             string
+	SdpCid                string
+	ParticipantID         livekit.ParticipantID
+	ParticipantIdentity   livekit.ParticipantIdentity
+	ParticipantVersion    uint32
+	BufferFactory         *buffer.Factory
+	ReceiverConfig        ReceiverConfig
+	SubscriberConfig      DirectionConfig
+	PLIThrottleConfig     config.PLIThrottleConfig
+	AudioConfig           config.AudioConfig
+	VideoConfig           config.VideoConfig
+	Telemetry             telemetry.TelemetryService
+	Logger                logger.Logger
+	SimTracks             map[uint32]SimulcastTrackInfo
+	OnRTCP                func([]rtcp.Packet)
+	ForwardStats          *sfu.ForwardStats
+	OnTrackEverSubscribed func(livekit.TrackID)
 }
 
 func NewMediaTrack(params MediaTrackParams, ti *livekit.TrackInfo) *MediaTrack {
@@ -91,7 +100,6 @@ func NewMediaTrack(params MediaTrackParams, ti *livekit.TrackInfo) *MediaTrack {
 		})
 		t.MediaLossProxy.OnMediaLossUpdate(func(fractionalLoss uint8) {
 			if t.buffer != nil {
-				// ok to access buffer since receivers are added before subscribers
 				t.buffer.SetLastFractionLostReport(fractionalLoss)
 			}
 		})
@@ -99,7 +107,7 @@ func NewMediaTrack(params MediaTrackParams, ti *livekit.TrackInfo) *MediaTrack {
 	}
 
 	if ti.Type == livekit.TrackType_VIDEO {
-		t.dynacastManager = NewDynacastManager(DynacastManagerParams{
+		t.dynacastManager = dynacast.NewDynacastManager(dynacast.DynacastManagerParams{
 			DynacastPauseDelay: params.VideoConfig.DynacastPauseDelay,
 			Logger:             params.Logger,
 		})
@@ -183,12 +191,14 @@ func (t *MediaTrack) UpdateCodecCid(codecs []*livekit.SimulcastCodec) {
 // AddReceiver adds a new RTP receiver to the track, returns true when receiver represents a new codec
 func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.TrackRemote, mid string) bool {
 	var newCodec bool
-	buff, rtcpReader := t.params.BufferFactory.GetBufferPair(uint32(track.SSRC()))
+	ssrc := uint32(track.SSRC())
+	buff, rtcpReader := t.params.BufferFactory.GetBufferPair(ssrc)
 	if buff == nil || rtcpReader == nil {
 		t.params.Logger.Errorw("could not retrieve buffer pair", nil)
 		return newCodec
 	}
 
+	var lastRR uint32
 	rtcpReader.OnPacket(func(bytes []byte) {
 		pkts, err := rtcp.Unmarshal(bytes)
 		if err != nil {
@@ -199,9 +209,29 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 		for _, pkt := range pkts {
 			switch pkt := pkt.(type) {
 			case *rtcp.SourceDescription:
-			// do nothing for now
 			case *rtcp.SenderReport:
-				buff.SetSenderReportData(pkt.RTPTime, pkt.NTPTime)
+				if pkt.SSRC == uint32(track.SSRC()) {
+					buff.SetSenderReportData(pkt.RTPTime, pkt.NTPTime, pkt.PacketCount, pkt.OctetCount)
+				}
+			case *rtcp.ExtendedReport:
+			rttFromXR:
+				for _, report := range pkt.Reports {
+					if rr, ok := report.(*rtcp.DLRRReportBlock); ok {
+						for _, dlrrReport := range rr.Reports {
+							if dlrrReport.LastRR <= lastRR {
+								continue
+							}
+							nowNTP := util.ToNtpTime(time.Now())
+							nowNTP32 := uint32(nowNTP >> 16)
+							ntpDiff := nowNTP32 - dlrrReport.LastRR - dlrrReport.DLRR
+							rtt := uint32(math.Ceil(float64(ntpDiff) * 1000.0 / 65536.0))
+							buff.SetRTT(rtt)
+							t.rttFromXR.Store(true)
+							lastRR = dlrrReport.LastRR
+							break rttFromXR
+						}
+					}
+				}
 			}
 		}
 	})
@@ -212,10 +242,10 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 	layer := buffer.RidToSpatialLayer(track.RID(), ti)
 	t.params.Logger.Debugw(
 		"AddReceiver",
-		"mime", track.Codec().MimeType,
 		"rid", track.RID(),
 		"layer", layer,
 		"ssrc", track.SSRC(),
+		"codec", track.Codec(),
 	)
 	wr := t.MediaTrackReceiver.Receiver(mime)
 	if wr == nil {
@@ -255,13 +285,12 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 			sfu.WithAudioConfig(t.params.AudioConfig),
 			sfu.WithLoadBalanceThreshold(20),
 			sfu.WithStreamTrackers(),
+			sfu.WithForwardStats(t.params.ForwardStats),
 		)
 		newWR.OnCloseHandler(func() {
-			t.params.Logger.Infow("webrtc receiver closed")
 			t.MediaTrackReceiver.SetClosing()
 			t.MediaTrackReceiver.ClearReceiver(mime, false)
 			if t.MediaTrackReceiver.TryClose() {
-				t.params.Logger.Infow("mediaTrack closed")
 				if t.dynacastManager != nil {
 					t.dynacastManager.Close()
 				}
@@ -327,11 +356,14 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 		t.SetSimulcast(true)
 	}
 
-	if t.IsSimulcast() {
-		t.MediaTrackReceiver.SetLayerSsrc(mime, track.RID(), uint32(track.SSRC()))
+	var bitrates int
+	if len(ti.Layers) > int(layer) {
+		bitrates = int(ti.Layers[layer].GetBitrate())
 	}
 
-	buff.Bind(receiver.GetParameters(), track.Codec().RTPCodecCapability)
+	t.MediaTrackReceiver.SetLayerSsrc(mime, track.RID(), uint32(track.SSRC()))
+
+	buff.Bind(receiver.GetParameters(), track.Codec().RTPCodecCapability, bitrates)
 
 	// if subscriber request fps before fps calculated, update them after fps updated.
 	buff.OnFpsChanged(func() {
@@ -361,7 +393,9 @@ func (t *MediaTrack) GetConnectionScoreAndQuality() (float32, livekit.Connection
 }
 
 func (t *MediaTrack) SetRTT(rtt uint32) {
-	t.MediaTrackReceiver.SetRTT(rtt)
+	if !t.rttFromXR.Load() {
+		t.MediaTrackReceiver.SetRTT(rtt)
+	}
 }
 
 func (t *MediaTrack) HasPendingCodec() bool {
@@ -380,13 +414,13 @@ func (t *MediaTrack) Restart() {
 	}
 }
 
-func (t *MediaTrack) Close(willBeResumed bool) {
+func (t *MediaTrack) Close(isExpectedToResume bool) {
 	t.MediaTrackReceiver.SetClosing()
 	if t.dynacastManager != nil {
 		t.dynacastManager.Close()
 	}
-	t.MediaTrackReceiver.ClearAllReceivers(willBeResumed)
-	t.MediaTrackReceiver.Close()
+	t.MediaTrackReceiver.ClearAllReceivers(isExpectedToResume)
+	t.MediaTrackReceiver.Close(isExpectedToResume)
 }
 
 func (t *MediaTrack) SetMuted(muted bool) {
@@ -398,4 +432,10 @@ func (t *MediaTrack) SetMuted(muted bool) {
 	}
 
 	t.MediaTrackReceiver.SetMuted(muted)
+}
+
+func (t *MediaTrack) OnTrackSubscribed() {
+	if !t.everSubscribed.Swap(true) && t.params.OnTrackEverSubscribed != nil {
+		go t.params.OnTrackEverSubscribed(t.ID())
+	}
 }
