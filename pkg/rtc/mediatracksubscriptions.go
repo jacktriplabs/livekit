@@ -110,7 +110,7 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *
 			t.params.Logger.Infow("livekit-bridge does not need to subscribe to video tracks")
 			return nil, ErrTrackNotNeeded
 		}
-	} else if sub.Identity() == "egress-service" || sub.Identity() == "video-capturer" {
+	} else if strings.HasPrefix(string(sub.Identity()), "egress-service") || sub.Identity() == "video-capturer" {
 		if t.params.MediaTrack.Kind() == livekit.TrackType_AUDIO {
 			t.params.Logger.Infow("egress-service does not need to subscribe to audio tracks")
 			return nil, ErrTrackNotNeeded
