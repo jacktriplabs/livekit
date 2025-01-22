@@ -34,7 +34,6 @@ import (
 	"github.com/livekit/livekit-server/pkg/sfu/audio"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
-	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
 	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 )
 
@@ -230,14 +229,16 @@ func NewWebRTCReceiver(
 	w.streamTrackerManager = NewStreamTrackerManager(logger, trackInfo, w.isSVC, w.codec.ClockRate, trackersConfig)
 	w.streamTrackerManager.SetListener(w)
 	// SVC-TODO: Handle DD for non-SVC cases???
-	if w.isSVC {
-		for _, ext := range receiver.GetParameters().HeaderExtensions {
-			if ext.URI == dd.ExtensionURI {
-				w.streamTrackerManager.AddDependencyDescriptorTrackers()
-				break
+	/*
+		if w.isSVC {
+			for _, ext := range receiver.GetParameters().HeaderExtensions {
+				if ext.URI == dd.ExtensionURI {
+					w.streamTrackerManager.AddDependencyDescriptorTrackers()
+					break
+				}
 			}
 		}
-	}
+	*/
 
 	return w
 }

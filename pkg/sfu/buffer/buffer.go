@@ -32,7 +32,6 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/sfu/audio"
 	act "github.com/livekit/livekit-server/pkg/sfu/rtpextension/abscapturetime"
-	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
 	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 	"github.com/livekit/livekit-server/pkg/sfu/utils"
 	sutils "github.com/livekit/livekit-server/pkg/utils"
@@ -229,17 +228,19 @@ func (b *Buffer) Bind(params webrtc.RTPParameters, codec webrtc.RTPCodecCapabili
 
 	for _, ext := range params.HeaderExtensions {
 		switch ext.URI {
-		case dd.ExtensionURI:
-			if IsSvcCodec(codec.MimeType) {
-				b.ddExtID = uint8(ext.ID)
-				frc := NewFrameRateCalculatorDD(b.clockRate, b.logger)
-				for i := range b.frameRateCalculator {
-					b.frameRateCalculator[i] = frc.GetFrameRateCalculatorForSpatial(int32(i))
-				}
-				b.ddParser = NewDependencyDescriptorParser(b.ddExtID, b.logger, func(spatial, temporal int32) {
-					frc.SetMaxLayer(spatial, temporal)
-				})
-			}
+		/*
+			case dd.ExtensionURI:
+					if IsSvcCodec(codec.MimeType) {
+						b.ddExtID = uint8(ext.ID)
+						frc := NewFrameRateCalculatorDD(b.clockRate, b.logger)
+						for i := range b.frameRateCalculator {
+							b.frameRateCalculator[i] = frc.GetFrameRateCalculatorForSpatial(int32(i))
+						}
+						b.ddParser = NewDependencyDescriptorParser(b.ddExtID, b.logger, func(spatial, temporal int32) {
+							frc.SetMaxLayer(spatial, temporal)
+						})
+					}
+		*/
 
 		case sdp.AudioLevelURI:
 			b.audioLevelExtID = uint8(ext.ID)

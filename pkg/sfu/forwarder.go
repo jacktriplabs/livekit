@@ -34,7 +34,6 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/codecmunger"
-	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
 	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 	"github.com/livekit/livekit-server/pkg/sfu/videolayerselector"
 	"github.com/livekit/livekit-server/pkg/sfu/videolayerselector/temporallayerselector"
@@ -302,11 +301,13 @@ func (f *Forwarder) DetermineCodec(codec webrtc.RTPCodecCapability, extensions [
 	f.codec = codec
 
 	ddAvailable := func(exts []webrtc.RTPHeaderExtensionParameter) bool {
-		for _, ext := range exts {
-			if ext.URI == dd.ExtensionURI {
-				return true
+		/*
+			for _, ext := range exts {
+				if ext.URI == dd.ExtensionURI {
+					return true
+				}
 			}
-		}
+		*/
 		return false
 	}
 
